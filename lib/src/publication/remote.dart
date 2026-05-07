@@ -133,6 +133,18 @@ class RemoteTrackPublication<T extends RemoteTrack> extends TrackPublication<T> 
     _metadataMuted = info.muted;
   }
 
+  bool _forceEnabled = false;
+
+  /// Pin this track to always stay enabled, bypassing adaptive stream
+  /// visibility checks. Use during PiP when a native platform view
+  /// must keep receiving frames regardless of Flutter widget visibility.
+  void setForceEnabled(bool value) {
+    if (_forceEnabled == value) return;
+    _forceEnabled = value;
+    _cancelPendingTrackSettingsUpdateRequest?.call();
+    _computeVideoViewVisibility(quick: true);
+  }
+
   void _computeVideoViewVisibility({
     bool quick = false,
   }) {
@@ -160,12 +172,12 @@ class RemoteTrackPublication<T extends RemoteTrack> extends TrackPublication<T> 
 
     logger.finer('[Visibility] ${track?.sid} watching ${viewSizes.length} views...');
 
-    if (viewSizes.isNotEmpty) {
-      // compute largest size
-      final largestSize = viewSizes.reduce((value, element) => maxOfSizes(value, element));
-
+    if (_forceEnabled || viewSizes.isNotEmpty) {
+      settings.disabled = false;
+      final largestSize = viewSizes.isNotEmpty
+          ? viewSizes.reduce((value, element) => maxOfSizes(value, element))
+          : const Size(720, 1280);
       settings
-        ..disabled = false
         ..width = largestSize.width.ceil()
         ..height = largestSize.height.ceil();
     }
