@@ -170,12 +170,16 @@ class RemoteTrackPublication<T extends RemoteTrack> extends TrackPublication<T> 
         .where((e) => e.hasSize)
         .map((e) => e.size);
 
-    logger.finer('[Visibility] ${track?.sid} watching ${viewSizes.length} views...');
+    // external view sizes registered by native platform views (e.g. PipVideoView)
+    final externalSizes = videoTrack.externalViewSizes.values;
 
-    if (_forceEnabled || viewSizes.isNotEmpty) {
+    logger.finer('[Visibility] ${track?.sid} watching ${viewSizes.length} views, ${externalSizes.length} external...');
+
+    if (_forceEnabled || viewSizes.isNotEmpty || externalSizes.isNotEmpty) {
       settings.disabled = false;
-      final largestSize = viewSizes.isNotEmpty
-          ? viewSizes.reduce((value, element) => maxOfSizes(value, element))
+      final allSizes = [...viewSizes, ...externalSizes];
+      final largestSize = allSizes.isNotEmpty
+          ? allSizes.reduce((value, element) => maxOfSizes(value, element))
           : const Size(720, 1280);
       settings
         ..width = largestSize.width.ceil()
