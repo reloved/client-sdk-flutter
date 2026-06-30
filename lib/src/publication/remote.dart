@@ -182,10 +182,14 @@ class RemoteTrackPublication<T extends RemoteTrack> extends TrackPublication<T> 
         .nonNulls
         .toList();
 
-    logger.finer('[Visibility] ${track?.sid} watching ${viewSizes.length} views...');
+    // external view sizes registered by native platform views (e.g. PipVideoView)
+    final externalSizes = videoTrack.externalViewSizes.values;
 
-    if (viewSizes.isNotEmpty) {
-      final largestSize = viewSizes.reduce(maxOfSizes);
+    logger.finer('[Visibility] ${track?.sid} watching ${viewSizes.length} views, ${externalSizes.length} external...');
+
+    if (viewSizes.isNotEmpty || externalSizes.isNotEmpty) {
+      final allSizes = [...viewSizes, ...externalSizes];
+      final largestSize = allSizes.reduce(maxOfSizes);
       _adaptiveStreamDimensions = VideoDimensions(
         largestSize.width.ceil(),
         largestSize.height.ceil(),

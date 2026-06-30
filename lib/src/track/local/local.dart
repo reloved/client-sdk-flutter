@@ -46,6 +46,13 @@ mixin VideoTrack on Track {
   @internal
   final List<VideoTrackViewRegistration> viewRegistrations = [];
 
+  /// External view sizes registered by non-VideoTrackRenderer views (e.g.
+  /// native PiP platform views). These are included in adaptive stream
+  /// visibility computation so the track stays enabled even when no
+  /// Flutter-rendered view is visible.
+  @internal
+  final Map<Key, Size> externalViewSizes = {};
+
   @internal
   VoidCallback? onVideoViewBuild;
 
@@ -61,6 +68,18 @@ mixin VideoTrack on Track {
   @internal
   void removeViewRegistration(VideoTrackViewRegistration registration) {
     viewRegistrations.remove(registration);
+  }
+
+  /// Register an external view size (e.g. from a native platform view used
+  /// for PiP). Adaptive stream treats these like regular view sizes.
+  void registerExternalViewSize(Key key, Size size) {
+    externalViewSizes[key] = size;
+  }
+
+  /// Unregister an external view size previously registered with
+  /// [registerExternalViewSize].
+  void unregisterExternalViewSize(Key key) {
+    externalViewSizes.remove(key);
   }
 }
 
