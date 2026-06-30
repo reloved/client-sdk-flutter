@@ -46,10 +46,7 @@ dependencies:
   json_annotation: ^4.9.0
 
   # Fix version to avoid version conflicts between WebRTC-SDK pods, which both this package and flutter_webrtc depend on.
-  flutter_webrtc:
-    git:
-      url: https://github.com/flutter-webrtc/flutter-webrtc.git
-      ref: 64923981dfccc4fdfd45ef23a2ca18ca183f4613
+  flutter_webrtc: 1.5.2
   dart_webrtc: ^1.8.0
 
 dev_dependencies:
