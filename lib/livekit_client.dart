@@ -14,6 +14,11 @@
 
 import 'src/types/rpc.dart' show kRpcVersion;
 
+export 'src/connection_check/checks/checker.dart';
+export 'src/connection_check/checks/cloud_region.dart' show RegionStats;
+export 'src/connection_check/checks/connection_protocol.dart' show ProtocolStats;
+export 'src/connection_check/connection_check.dart';
+export 'src/connection_check/events.dart';
 export 'src/constants.dart';
 export 'src/core/room.dart';
 export 'src/core/room_preconnect.dart';
@@ -83,7 +88,7 @@ export 'src/token_source/literal.dart';
 export 'src/token_source/endpoint.dart';
 export 'src/token_source/custom.dart';
 export 'src/token_source/caching.dart';
-export 'src/token_source/sandbox.dart';
+export 'src/token_source/development.dart';
 export 'src/token_source/jwt.dart';
 
 /// Misspelled alias for [kRpcVersion]. Kept for backwards compatibility with code

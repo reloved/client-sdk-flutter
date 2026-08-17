@@ -192,12 +192,12 @@ abstract class LocalTrack extends Track {
   TrackProcessor? get processor => _processor;
 
   LocalTrack(TrackType kind, TrackSource source, rtc.MediaStream mediaStream, rtc.MediaStreamTrack mediaStreamTrack)
-      : super(
-          kind,
-          source,
-          mediaStream,
-          mediaStreamTrack,
-        ) {
+    : super(
+        kind,
+        source,
+        mediaStream,
+        mediaStreamTrack,
+      ) {
     mediaStreamTrack.onEnded = () {
       logger.fine('MediaStreamTrack.onEnded()');
       events.emit(TrackEndedEvent(track: this));
@@ -268,8 +268,8 @@ abstract class LocalTrack extends Track {
       'audio': options is AudioCaptureOptions
           ? options.toMediaConstraintsMap()
           : options is ScreenShareCaptureOptions
-              ? (options).captureScreenAudio
-              : false,
+          ? (options).captureScreenAudio
+          : false,
       'video': options is VideoCaptureOptions ? options.toMediaConstraintsMap() : false,
     };
 
@@ -348,10 +348,12 @@ abstract class LocalTrack extends Track {
     await start();
 
     // notify so VideoView can re-compute mirror mode if necessary
-    events.emit(LocalTrackOptionsUpdatedEvent(
-      track: this,
-      options: currentOptions,
-    ));
+    events.emit(
+      LocalTrackOptionsUpdatedEvent(
+        track: this,
+        options: currentOptions,
+      ),
+    );
   }
 
   Future<void> setProcessor(TrackProcessor? processor) async {

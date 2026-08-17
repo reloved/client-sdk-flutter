@@ -56,6 +56,9 @@ class LocalAudioTrack extends LocalTrack with AudioTrack, LocalAudioManagementMi
   /// [LocalTrackOptionsUpdatedEvent]. When the native layer cannot apply the
   /// options, throws [track_options.AudioProcessingException] and leaves
   /// [currentOptions] unchanged.
+  ///
+  /// Experimental: this API may change in a future release.
+  @experimental
   Future<void> setAudioProcessingOptions(track_options.AudioProcessingOptions options) async {
     final nextOptions = currentOptions.copyWith(processing: options);
     final response = await Native.setAudioProcessingOptions(
@@ -66,10 +69,12 @@ class LocalAudioTrack extends LocalTrack with AudioTrack, LocalAudioManagementMi
     _throwIfAudioProcessingFailed(response);
 
     currentOptions = nextOptions;
-    events.emit(LocalTrackOptionsUpdatedEvent(
-      track: this,
-      options: currentOptions,
-    ));
+    events.emit(
+      LocalTrackOptionsUpdatedEvent(
+        track: this,
+        options: currentOptions,
+      ),
+    );
   }
 
   num? _currentBitrate;
@@ -162,11 +167,11 @@ class LocalAudioTrack extends LocalTrack with AudioTrack, LocalAudioManagementMi
     rtc.MediaStreamTrack track,
     this.currentOptions,
   ) : super(
-          TrackType.AUDIO,
-          source,
-          stream,
-          track,
-        );
+        TrackType.AUDIO,
+        source,
+        stream,
+        track,
+      );
 
   /// Creates a new audio track from the default audio input device.
   static Future<LocalAudioTrack> create([
