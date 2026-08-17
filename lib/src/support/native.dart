@@ -110,15 +110,15 @@ class Native {
   }
 
   static Map<String, dynamic> _audioProcessingPlatformUnavailable() => <String, dynamic>{
-        'result': false,
-        'code': 'rejectedPlatformUnavailable',
-        'message': 'Audio processing options are unavailable on this platform.',
-      };
+    'result': false,
+    'code': 'rejectedPlatformUnavailable',
+    'message': 'Audio processing options are unavailable on this platform.',
+  };
 
   static PlatformException _audioProcessingPlatformUnavailableException() => PlatformException(
-        code: 'rejectedPlatformUnavailable',
-        message: 'Audio processing options are unavailable on this platform.',
-      );
+    code: 'rejectedPlatformUnavailable',
+    message: 'Audio processing options are unavailable on this platform.',
+  );
 
   /// Starts the native WebRTC audio device module recording path with the
   /// capture-time audio processing options for the local microphone track.
@@ -219,16 +219,98 @@ class Native {
 
   /// Enable or disable LiveKit's automatic iOS audio-session management from
   /// native WebRTC audio-engine lifecycle callbacks.
+  ///
+  /// [sessionActivationEnabled] controls whether LiveKit may activate or
+  /// deactivate the session at all. When false, LiveKit only configures the
+  /// category/mode and an external system (CallKit) owns activation timing.
   @internal
-  static Future<void> setAppleAudioSessionAutomaticManagementEnabled(bool enabled) async {
+  static Future<void> setAppleAudioSessionAutomaticManagementEnabled(
+    bool enabled, {
+    bool sessionActivationEnabled = true,
+  }) async {
     try {
       await channel.invokeMethod<void>(
         'setAppleAudioSessionAutomaticManagementEnabled',
-        <String, dynamic>{'enabled': enabled},
+        <String, dynamic>{
+          'enabled': enabled,
+          'sessionActivationEnabled': sessionActivationEnabled,
+        },
       );
     } catch (error) {
       logger.warning('setAppleAudioSessionAutomaticManagementEnabled did throw $error');
     }
+  }
+
+  /// Sets how the audio device module mutes microphone input (iOS/macOS).
+  ///
+  /// Unlike most methods in this class this deliberately does not swallow
+  /// platform errors: a failed change means muting behaves differently from
+  /// what the caller selected, so the error must reach the caller.
+  @internal
+  static Future<void> setMicrophoneMuteMode(String mode) async {
+    await channel.invokeMethod<void>(
+      'setMicrophoneMuteMode',
+      <String, dynamic>{'mode': mode},
+    );
+  }
+
+  /// Reads the audio device module's microphone mute mode (iOS/macOS).
+  /// Returns null when the native side cannot provide it.
+  @internal
+  static Future<String?> getMicrophoneMuteMode() async {
+    try {
+      return await channel.invokeMethod<String>('getMicrophoneMuteMode', <String, dynamic>{});
+    } catch (error) {
+      logger.warning('getMicrophoneMuteMode did throw $error');
+      return null;
+    }
+  }
+
+  /// Requests microphone permission before audio capture starts (iOS/macOS).
+  ///
+  /// The WebRTC audio device only checks the permission and fails when it is
+  /// missing, so the SDK requests it here. On iOS the prompt is only shown while
+  /// the app is active. Throws a [PlatformException] with code
+  /// `deviceAccessDenied` when permission is denied, restricted, or could not be
+  /// requested. A no-op where the platform does not implement it, or while the
+  /// engine's input availability is disabled via [setEngineAvailability] (the
+  /// audio device defers opening input there, so no permission is needed yet).
+  @internal
+  static Future<void> ensureMicrophoneAccess() async {
+    try {
+      await channel.invokeMethod<void>('ensureMicrophoneAccess', <String, dynamic>{});
+    } on PlatformException catch (error) {
+      if (error.code == 'Unimplemented') return;
+      rethrow;
+    } on MissingPluginException {
+      return;
+    }
+  }
+
+  /// Sets whether the WebRTC audio engine is allowed to run (iOS/macOS).
+  ///
+  /// Unlike most methods in this class this deliberately does not swallow
+  /// platform errors: a failed availability change means the engine may run
+  /// outside the window the caller intended (e.g. CallKit's
+  /// didActivate/didDeactivate), so the error must reach the caller.
+  ///
+  /// Microphone permission is not requested here. A recording requested while
+  /// input was unavailable is honored on re-enable, but the audio device only
+  /// passively checks permission at that point, so it must be granted before
+  /// input availability is restored. Otherwise this throws a
+  /// [PlatformException] with code `deviceAccessDenied`.
+  @internal
+  static Future<void> setEngineAvailability({
+    required bool isInputAvailable,
+    required bool isOutputAvailable,
+  }) async {
+    await channel.invokeMethod<void>(
+      'setEngineAvailability',
+      <String, dynamic>{
+        'isInputAvailable': isInputAvailable,
+        'isOutputAvailable': isOutputAvailable,
+      },
+    );
   }
 
   @internal

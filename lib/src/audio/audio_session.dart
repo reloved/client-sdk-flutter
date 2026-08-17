@@ -18,6 +18,8 @@ import 'package:meta/meta.dart';
 
 import '../support/value_or_absent.dart';
 
+/// Experimental: this API may change in a future release.
+@experimental
 enum AudioSessionManagementMode {
   /// LiveKit updates the platform audio session based on room/track lifecycle.
   automatic,
@@ -27,9 +29,36 @@ enum AudioSessionManagementMode {
   /// The app must call AudioManager APIs when it wants to apply a session
   /// configuration.
   manual,
+
+  /// An external telephony system (iOS CallKit / Android Telecom) owns the
+  /// platform audio lifecycle.
+  ///
+  /// On iOS, LiveKit keeps configuring the session's category/mode/options
+  /// from the audio engine lifecycle like [automatic], but never activates or
+  /// deactivates the session, since CallKit owns activation timing. Combine
+  /// with `AudioManager.setEngineAvailability` so the engine only runs inside
+  /// CallKit's `didActivate`/`didDeactivate` window.
+  ///
+  /// On Android this currently behaves like [automatic] for session
+  /// configuration, so a cross-platform app can set this mode once at
+  /// startup: iOS gets the CallKit contract and Android keeps LiveKit's
+  /// normal session management. When Telecom (`androidx.core.telecom`)
+  /// integration lands, this mode will stand down LiveKit's audio-focus and
+  /// routing management, which the Telecom framework owns for registered
+  /// calls.
+  ///
+  /// `AudioManager.deactivateAudioSession` is disabled in this mode on all
+  /// platforms, since releasing platform audio belongs to the external call
+  /// system.
+  ///
+  /// Experimental: this API may change in a future release.
+  @experimental
+  externalCallSystem,
 }
 
 @immutable
+/// Experimental: this API may change in a future release.
+@experimental
 class AudioSessionOptions {
   /// Exact Apple session configuration for manual mode.
   final AppleAudioSessionConfiguration apple;
@@ -69,14 +98,15 @@ class AudioSessionOptions {
   AudioSessionOptions copyWith({
     ValueOrAbsent<AppleAudioSessionConfiguration> apple = const ValueOrAbsent.absent(),
     ValueOrAbsent<AndroidAudioSessionConfiguration> android = const ValueOrAbsent.absent(),
-  }) =>
-      AudioSessionOptions._(
-        apple: apple.valueOr(this.apple),
-        android: android.valueOr(this.android),
-      );
+  }) => AudioSessionOptions._(
+    apple: apple.valueOr(this.apple),
+    android: android.valueOr(this.android),
+  );
 }
 
 // https://developer.apple.com/documentation/avfaudio/avaudiosession/category
+/// Experimental: this API may change in a future release.
+@experimental
 enum AppleAudioCategory {
   soloAmbient,
   playback,
@@ -86,6 +116,8 @@ enum AppleAudioCategory {
 }
 
 // https://developer.apple.com/documentation/avfaudio/avaudiosession/categoryoptions
+/// Experimental: this API may change in a future release.
+@experimental
 enum AppleAudioCategoryOption {
   mixWithOthers, // Only playAndRecord, playback, or multiRoute.
   duckOthers, // Only playAndRecord, playback, or multiRoute.
@@ -97,6 +129,8 @@ enum AppleAudioCategoryOption {
 }
 
 // https://developer.apple.com/documentation/avfaudio/avaudiosession/mode
+/// Experimental: this API may change in a future release.
+@experimental
 enum AppleAudioMode {
   default_,
   gameChat,
@@ -110,6 +144,8 @@ enum AppleAudioMode {
 }
 
 @immutable
+/// Experimental: this API may change in a future release.
+@experimental
 class AppleAudioSessionConfiguration {
   /// AVAudioSession category.
   final AppleAudioCategory? category;
@@ -146,14 +182,15 @@ class AppleAudioSessionConfiguration {
     ValueOrAbsent<AppleAudioCategory?> category = const ValueOrAbsent.absent(),
     ValueOrAbsent<Set<AppleAudioCategoryOption>?> categoryOptions = const ValueOrAbsent.absent(),
     ValueOrAbsent<AppleAudioMode?> mode = const ValueOrAbsent.absent(),
-  }) =>
-      AppleAudioSessionConfiguration(
-        category: category.valueOr(this.category),
-        categoryOptions: categoryOptions.valueOr(this.categoryOptions),
-        mode: mode.valueOr(this.mode),
-      );
+  }) => AppleAudioSessionConfiguration(
+    category: category.valueOr(this.category),
+    categoryOptions: categoryOptions.valueOr(this.categoryOptions),
+    mode: mode.valueOr(this.mode),
+  );
 }
 
+/// Experimental: this API may change in a future release.
+@experimental
 enum AndroidAudioMode {
   normal,
   callScreening,
@@ -162,6 +199,8 @@ enum AndroidAudioMode {
   ringtone,
 }
 
+/// Experimental: this API may change in a future release.
+@experimental
 enum AndroidAudioFocusMode {
   gain,
   gainTransient,
@@ -169,6 +208,8 @@ enum AndroidAudioFocusMode {
   gainTransientMayDuck,
 }
 
+/// Experimental: this API may change in a future release.
+@experimental
 enum AndroidAudioStreamType {
   accessibility,
   alarm,
@@ -180,6 +221,8 @@ enum AndroidAudioStreamType {
   voiceCall,
 }
 
+/// Experimental: this API may change in a future release.
+@experimental
 enum AndroidAudioAttributesUsageType {
   alarm,
   assistanceAccessibility,
@@ -196,6 +239,8 @@ enum AndroidAudioAttributesUsageType {
   voiceCommunicationSignalling,
 }
 
+/// Experimental: this API may change in a future release.
+@experimental
 enum AndroidAudioAttributesContentType {
   movie,
   music,
@@ -205,6 +250,8 @@ enum AndroidAudioAttributesContentType {
 }
 
 @immutable
+/// Experimental: this API may change in a future release.
+@experimental
 class AndroidAudioSessionConfiguration {
   /// Android AudioManager mode.
   final AndroidAudioMode? audioMode;
@@ -263,14 +310,13 @@ class AndroidAudioSessionConfiguration {
     ValueOrAbsent<AndroidAudioAttributesUsageType?> usageType = const ValueOrAbsent.absent(),
     ValueOrAbsent<AndroidAudioAttributesContentType?> contentType = const ValueOrAbsent.absent(),
     ValueOrAbsent<bool?> forceAudioRouting = const ValueOrAbsent.absent(),
-  }) =>
-      AndroidAudioSessionConfiguration(
-        audioMode: audioMode.valueOr(this.audioMode),
-        manageAudioFocus: manageAudioFocus.valueOr(this.manageAudioFocus),
-        focusMode: focusMode.valueOr(this.focusMode),
-        streamType: streamType.valueOr(this.streamType),
-        usageType: usageType.valueOr(this.usageType),
-        contentType: contentType.valueOr(this.contentType),
-        forceAudioRouting: forceAudioRouting.valueOr(this.forceAudioRouting),
-      );
+  }) => AndroidAudioSessionConfiguration(
+    audioMode: audioMode.valueOr(this.audioMode),
+    manageAudioFocus: manageAudioFocus.valueOr(this.manageAudioFocus),
+    focusMode: focusMode.valueOr(this.focusMode),
+    streamType: streamType.valueOr(this.streamType),
+    usageType: usageType.valueOr(this.usageType),
+    contentType: contentType.valueOr(this.contentType),
+    forceAudioRouting: forceAudioRouting.valueOr(this.forceAudioRouting),
+  );
 }

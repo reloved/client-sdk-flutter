@@ -17,9 +17,11 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:livekit_client/src/audio/android_audio_session_adapter.dart';
+import 'package:livekit_client/src/audio/audio_engine_error.dart';
 import 'package:livekit_client/src/audio/audio_manager.dart';
 import 'package:livekit_client/src/audio/audio_session.dart';
 import 'package:livekit_client/src/audio/audio_session_policy.dart';
+import 'package:livekit_client/src/exceptions.dart';
 import 'package:livekit_client/src/support/native.dart';
 import 'package:livekit_client/src/support/native_audio.dart' as native_audio;
 import 'package:livekit_client/src/support/webrtc_initialize_options.dart';
@@ -38,32 +40,31 @@ void main() {
     bool preferSpeakerOutput = true,
     bool forceSpeakerOutput = false,
     bool automatic = true,
-  }) =>
-      ResolvedAudioSessionPolicy(
-        options: options,
-        preferSpeakerOutput: preferSpeakerOutput,
-        forceSpeakerOutput: forceSpeakerOutput && preferSpeakerOutput,
-        automatic: automatic,
-      ).appleConfiguration;
+  }) => ResolvedAudioSessionPolicy(
+    options: options,
+    preferSpeakerOutput: preferSpeakerOutput,
+    forceSpeakerOutput: forceSpeakerOutput && preferSpeakerOutput,
+    automatic: automatic,
+  ).appleConfiguration;
 
   AndroidAudioSessionConfiguration resolveAndroidPolicy(
     AudioSessionOptions options, {
     bool automatic = true,
-  }) =>
-      ResolvedAudioSessionPolicy(
-        options: options,
-        preferSpeakerOutput: AudioManager.instance.isSpeakerOutputPreferred,
-        forceSpeakerOutput: AudioManager.instance.isSpeakerOutputForced,
-        automatic: automatic,
-      ).androidConfiguration;
+  }) => ResolvedAudioSessionPolicy(
+    options: options,
+    preferSpeakerOutput: AudioManager.instance.isSpeakerOutputPreferred,
+    forceSpeakerOutput: AudioManager.instance.isSpeakerOutputForced,
+    automatic: automatic,
+  ).androidConfiguration;
 
   group('AudioSessionManagementMode', () {
-    test('supports automatic and manual management', () {
+    test('supports automatic, manual, and external call system management', () {
       expect(
         AudioSessionManagementMode.values,
         [
           AudioSessionManagementMode.automatic,
           AudioSessionManagementMode.manual,
+          AudioSessionManagementMode.externalCallSystem,
         ],
       );
     });
@@ -590,6 +591,52 @@ void main() {
       expect(calls.single.arguments, {'enable': true, 'force': true});
     });
 
+    test('passes microphone mute mode to platform method', () async {
+      await Native.setMicrophoneMuteMode('inputMixer');
+
+      expect(calls.single.method, 'setMicrophoneMuteMode');
+      expect(calls.single.arguments, {'mode': 'inputMixer'});
+    });
+
+    test('passes session activation ownership to Apple management method', () async {
+      await Native.setAppleAudioSessionAutomaticManagementEnabled(true, sessionActivationEnabled: false);
+
+      expect(calls.single.method, 'setAppleAudioSessionAutomaticManagementEnabled');
+      expect(calls.single.arguments, {'enabled': true, 'sessionActivationEnabled': false});
+    });
+
+    test('passes engine availability to platform method', () async {
+      await Native.setEngineAvailability(isInputAvailable: false, isOutputAvailable: true);
+
+      expect(calls.single.method, 'setEngineAvailability');
+      expect(calls.single.arguments, {'isInputAvailable': false, 'isOutputAvailable': true});
+    });
+
+    test('initial session options seed under an external call system', () async {
+      AudioManager.instance.resetForTest();
+      await AudioManager.instance.setAudioSessionManagementMode(AudioSessionManagementMode.externalCallSystem);
+
+      const options = AudioSessionOptions.mediaPlayback();
+      AudioManager.instance.setInitialAudioSessionOptions(options);
+
+      expect(AudioManager.instance.options, options);
+
+      AudioManager.instance.resetForTest();
+    });
+
+    test('deactivateAudioSession is a no-op under an external call system', () async {
+      AudioManager.instance.resetForTest();
+      await AudioManager.instance.setAudioSessionManagementMode(AudioSessionManagementMode.externalCallSystem);
+      calls.clear();
+
+      await AudioManager.instance.deactivateAudioSession();
+
+      expect(calls, isEmpty);
+      expect(AudioManager.instance.managementMode, AudioSessionManagementMode.externalCallSystem);
+
+      AudioManager.instance.resetForTest();
+    });
+
     test('passes audio session deactivation to platform methods', () async {
       await Native.stopAndroidAudioSession();
       await Native.deactivateAppleAudioSession();
@@ -694,11 +741,13 @@ void main() {
 
       await expectLater(
         Native.startLocalRecording(<String, dynamic>{'echoCancellation': true}),
-        throwsA(isA<PlatformException>().having(
-          (error) => error.code,
-          'code',
-          'rejectedPlatformUnavailable',
-        )),
+        throwsA(
+          isA<PlatformException>().having(
+            (error) => error.code,
+            'code',
+            'rejectedPlatformUnavailable',
+          ),
+        ),
       );
     });
 
@@ -713,11 +762,13 @@ void main() {
 
       await expectLater(
         Native.startLocalRecording(<String, dynamic>{'echoCancellation': true}),
-        throwsA(isA<PlatformException>().having(
-          (error) => error.code,
-          'code',
-          'rejectedPlatformUnavailable',
-        )),
+        throwsA(
+          isA<PlatformException>().having(
+            (error) => error.code,
+            'code',
+            'rejectedPlatformUnavailable',
+          ),
+        ),
       );
       expect(calls.single.method, 'startLocalRecording');
     });
@@ -822,6 +873,67 @@ void main() {
         ),
         isEmpty,
       );
+    });
+  });
+
+  group('Native.ensureMicrophoneAccess', () {
+    test('is a no-op when the platform does not implement it', () async {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
+        Native.channel,
+        (call) async => throw PlatformException(code: 'Unimplemented'),
+      );
+      await expectLater(Native.ensureMicrophoneAccess(), completes);
+
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
+        Native.channel,
+        null,
+      );
+      await expectLater(Native.ensureMicrophoneAccess(), completes);
+    });
+
+    test('propagates a denied permission so callers can map it', () async {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
+        Native.channel,
+        (call) async {
+          expect(call.method, 'ensureMicrophoneAccess');
+          throw PlatformException(code: audioEngineErrorCodeDeviceAccessDenied, message: 'denied');
+        },
+      );
+
+      await expectLater(
+        Native.ensureMicrophoneAccess(),
+        throwsA(isA<PlatformException>().having((error) => error.code, 'code', audioEngineErrorCodeDeviceAccessDenied)),
+      );
+    });
+  });
+
+  group('audioEngineExceptionFrom', () {
+    test('maps missing microphone permission to TrackCreateException', () {
+      final error = audioEngineExceptionFrom(
+        PlatformException(code: audioEngineErrorCodeDeviceAccessDenied, message: 'no mic'),
+      );
+
+      expect(error, isA<TrackCreateException>());
+      expect(error!.message, 'no mic');
+    });
+
+    test('maps audio session failures to AudioSessionException', () {
+      final invalidCategory = audioEngineExceptionFrom(
+        PlatformException(code: audioEngineErrorCodeAudioSessionInvalidCategory),
+      );
+      final configureFailed = audioEngineExceptionFrom(
+        PlatformException(code: audioEngineErrorCodeAudioSessionConfigureFailed, message: '  detail  '),
+      );
+
+      expect(invalidCategory, isA<AudioSessionException>());
+      expect(invalidCategory!.message, 'Audio session category does not support recording');
+      expect(configureFailed, isA<AudioSessionException>());
+      expect(configureFailed!.message, 'detail');
+    });
+
+    test('leaves other codes to the caller', () {
+      expect(audioEngineExceptionFrom(PlatformException(code: 'applyFailed')), isNull);
+      expect(audioEngineExceptionFrom(PlatformException(code: 'setEngineAvailability')), isNull);
     });
   });
 }

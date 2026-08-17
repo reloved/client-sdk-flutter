@@ -183,9 +183,15 @@ abstract class Track extends DisposableChangeNotifier with EventsEmittable<Track
 
   @internal
   void startMonitor() {
-    _monitorTimer ??= Timer.periodic(const Duration(milliseconds: monitorFrequency), (_) async {
-      if (!await monitorStats()) {
-        stopMonitor();
+    if (_monitorTimer != null) return;
+    var inFlight = false;
+    _monitorTimer = Timer.periodic(const Duration(milliseconds: monitorFrequency), (timer) async {
+      if (inFlight || !identical(_monitorTimer, timer)) return;
+      inFlight = true;
+      try {
+        if (!await monitorStats() && identical(_monitorTimer, timer)) stopMonitor();
+      } finally {
+        inFlight = false;
       }
     });
   }
@@ -205,11 +211,13 @@ abstract class Track extends DisposableChangeNotifier with EventsEmittable<Track
     if (_muted == muted) return;
     _muted = muted;
     if (shouldNotify) {
-      events.emit(InternalTrackMuteUpdatedEvent(
-        track: this,
-        muted: muted,
-        shouldSendSignal: shouldSendSignal,
-      ));
+      events.emit(
+        InternalTrackMuteUpdatedEvent(
+          track: this,
+          muted: muted,
+          shouldSendSignal: shouldSendSignal,
+        ),
+      );
     }
   }
 
@@ -217,10 +225,12 @@ abstract class Track extends DisposableChangeNotifier with EventsEmittable<Track
   void updateMediaStreamAndTrack(rtc.MediaStream stream, rtc.MediaStreamTrack track) {
     _mediaStream = stream;
     _mediaStreamTrack = track;
-    events.emit(TrackStreamUpdatedEvent(
-      track: this,
-      stream: stream,
-    ));
+    events.emit(
+      TrackStreamUpdatedEvent(
+        track: this,
+        stream: stream,
+      ),
+    );
   }
 
   @internal

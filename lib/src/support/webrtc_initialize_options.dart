@@ -22,9 +22,12 @@ Map<String, dynamic> liveKitWebRTCInitializeOptions({
   required bool bypassVoiceProcessing,
   required AudioSessionOptions? initialAudioSessionOptions,
   required bool includeAndroidAudioConfiguration,
-}) =>
-    {
-      if (bypassVoiceProcessing) 'bypassVoiceProcessing': bypassVoiceProcessing,
-      if (includeAndroidAudioConfiguration && initialAudioSessionOptions != null)
-        'androidAudioConfiguration': androidAudioSessionConfigurationToMap(initialAudioSessionOptions.android),
-    };
+  bool enableWARP = false,
+  bool zeroPlayoutDelay = false,
+}) => {
+  if (bypassVoiceProcessing) 'bypassVoiceProcessing': bypassVoiceProcessing,
+  if (includeAndroidAudioConfiguration && initialAudioSessionOptions != null)
+    'androidAudioConfiguration': androidAudioSessionConfigurationToMap(initialAudioSessionOptions.android),
+  if (enableWARP) 'enableWARP': enableWARP,
+  if (zeroPlayoutDelay) 'zeroPlayoutDelay': zeroPlayoutDelay,
+};
