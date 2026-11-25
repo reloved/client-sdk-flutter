@@ -41,6 +41,7 @@ import '../publication/local.dart';
 import '../support/disposable.dart';
 import '../support/platform.dart' show lkPlatformIsTest, lkPlatformIs, PlatformType;
 import '../support/region_url_provider.dart';
+import '../support/reusable_completer.dart';
 import '../support/websocket.dart';
 import '../track/local/local.dart';
 import '../track/local/video.dart';
@@ -66,6 +67,28 @@ const defaultRetryDelaysInMs = [
   maxRetryDelay,
 ];
 
+/// Upper bound of the random delay used for the first retry, whose base delay is 0.
+///
+/// Kept well under the 300ms of the second retry: the first attempt exists to recover from a
+/// brief blip straight away, so the window only has to be wide enough to pull a herd of clients
+/// apart, not to back off.
+const maxFirstRetryJitterInMs = 150;
+
+/// The delay to wait before reconnect attempt [retryCount], with jitter applied
+/// so that clients disconnected by the same event do not retry in lockstep.
+@internal
+int reconnectDelayInMs(int retryCount) {
+  final retryDelay = defaultRetryDelaysInMs[retryCount];
+
+  // A zero base delay has nothing to scale, so it draws from a fixed window instead.
+  if (retryDelay == 0) {
+    return (math.Random().nextDouble() * maxFirstRetryJitterInMs).round();
+  }
+
+  // Jitter scales with the delay (+/-50%) so clients spread out further on later retries.
+  return (retryDelay * (0.5 + math.Random().nextDouble())).round();
+}
+
 class Engine extends Disposable with EventsEmittable<EngineEvent> {
   static const _lossyDCLabel = '_lossy';
   static const _reliableDCLabel = '_reliable';
@@ -81,10 +104,11 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
   Transport? subscriber;
 
   @internal
-  Transport? get primary => _subscriberPrimary ? subscriber : publisher;
+  Transport? get primary => _singlePCMode ? publisher : (_subscriberPrimary ? subscriber : publisher);
 
-  rtc.RTCDataChannel? get dataChannel =>
-      _subscriberPrimary ? _reliableDCSub ?? _lossyDCSub : _reliableDCPub ?? _lossyDCPub;
+  rtc.RTCDataChannel? get dataChannel => _singlePCMode
+      ? _reliableDCPub ?? _lossyDCPub
+      : (_subscriberPrimary ? _reliableDCSub ?? _lossyDCSub : _reliableDCPub ?? _lossyDCPub);
 
   // data channels for packets
   rtc.RTCDataChannel? _reliableDCPub;
@@ -99,6 +123,23 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
   // this is helpful to know if we need to restart ICE on the publisher connection
   bool _hasPublished = false;
 
+  /// Whether the publisher transport has to be connected and restarted with the
+  /// session. In single PC mode it carries subscribed media and data from the
+  /// start, as `needsPublisher` is for client-sdk-js's publisher-only mode.
+  bool get _publisherRequired => _singlePCMode || _hasPublished;
+
+  bool _failNextV1Path = false;
+
+  /// Set when the server answered /rtc/v1 with ServiceNotFound and the session
+  /// fell back to /rtc. Kept across full reconnects, reset by [connect].
+  bool _v1PathUnavailable = false;
+
+  /// Testing only: the next connect over the /rtc/v1 path fails as if the server
+  /// did not have it (ServiceNotFound), so the client falls back to /rtc and
+  /// dual peer connection. Mirrors client-sdk-js's `failNextV1Path`.
+  @internal
+  void failNextV1Path() => _failNextV1Path = true;
+
   lk_models.ClientConfiguration? _clientConfiguration;
 
   // remember url and token for reconnect
@@ -110,6 +151,12 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
   FastConnectOptions? fastConnectOptions;
 
   bool _subscriberPrimary = false;
+  bool _singlePCMode = false;
+
+  /// Track sid per media section mid, from the latest server description that
+  /// carried one. In single PC mode the receiving track's id is generated
+  /// locally, so this is the only way to tell which track arrived.
+  Map<String, String> _midToTrackId = const {};
 
   String? _connectedServerAddress;
   String? get connectedServerAddress => _connectedServerAddress;
@@ -156,6 +203,15 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
     Reliability.lossy: false,
   };
 
+  // Completed whenever something a waiting send depends on changes: a buffer status, the reconnect
+  // state or closure. A wait checks its condition again each time it wakes.
+  final ReusableCompleter<void> _sendStateChanged = ReusableCompleter<void>();
+
+  void _setBufferStatus(Reliability kind, bool isLow) {
+    _dcBufferStatus[kind] = isLow;
+    _sendStateChanged.complete();
+  }
+
   List<lk_models.Codec>? _enabledPublishCodecs;
 
   List<lk_models.Codec>? get enabledPublishCodecs => _enabledPublishCodecs;
@@ -175,7 +231,12 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
     maxPacketCount: 1000, // max 1000 packets
   );
   final TTLMap<String, int> _reliableReceivedState = TTLMap<String, int>(30000);
-  bool _isReconnecting = false;
+  bool _reconnecting = false;
+  bool get _isReconnecting => _reconnecting;
+  set _isReconnecting(bool value) {
+    _reconnecting = value;
+    _sendStateChanged.complete();
+  }
 
   Completer<void>? _publisherConnectionCompleter;
 
@@ -220,7 +281,6 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
     _setUpSignalListeners();
 
     onDispose(() async {
-      _isClosed = true;
       await cleanUp();
       await events.dispose();
       await _signalListener.dispose();
@@ -228,7 +288,41 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
     });
   }
 
+  @override
+  Future<bool> dispose() {
+    // Disposal callbacks run in reverse registration order and may await engine work.
+    markClosed();
+    return super.dispose();
+  }
+
   Future<void> connect(
+    String url,
+    String token, {
+    ConnectOptions? connectOptions,
+    RoomOptions? roomOptions,
+    FastConnectOptions? fastConnectOptions,
+    RegionUrlProvider? regionUrlProvider,
+  }) async {
+    _isClosed = false;
+    // a new connection, possibly to another server, probes /rtc/v1 again
+    _v1PathUnavailable = false;
+    // disconnect() cancels the signal listeners when it stops a pending
+    // reconnect, so a connect starts from a fresh set.
+    await _signalListener.cancelAll();
+    _recreateSignalListener();
+    await _connect(
+      url,
+      token,
+      connectOptions: connectOptions,
+      roomOptions: roomOptions,
+      fastConnectOptions: fastConnectOptions,
+      regionUrlProvider: regionUrlProvider,
+    );
+  }
+
+  // Shared by connect() and restartConnection(). Leaves _isClosed alone, so a
+  // disconnect() that lands while a full reconnect is connecting stays in effect.
+  Future<void> _connect(
     String url,
     String token, {
     ConnectOptions? connectOptions,
@@ -247,19 +341,41 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
       _regionUrlProvider = regionUrlProvider;
     }
 
-    //reset state
-    _isClosed = false;
-
     final connectStopwatch = Stopwatch()..start();
 
     try {
       // wait for socket to connect rtc server
-      await signalClient.connect(
-        url,
-        token,
-        connectOptions: this.connectOptions,
-        roomOptions: this.roomOptions,
-      );
+      // once this server turned out not to serve /rtc/v1, full reconnects go
+      // straight to /rtc instead of probing v1 again
+      final signalOptions = _v1PathUnavailable
+          ? this.connectOptions.copyWith(singlePeerConnection: false)
+          : this.connectOptions;
+      try {
+        if (_failNextV1Path && signalOptions.singlePeerConnection) {
+          _failNextV1Path = false;
+          throw ConnectException('Simulated v1 path failure', reason: ConnectionErrorReason.ServiceNotFound);
+        }
+        await signalClient.connect(
+          url,
+          token,
+          connectOptions: signalOptions,
+          roomOptions: this.roomOptions,
+        );
+      } on ConnectException catch (e) {
+        // If v1 path returned ServiceNotFound, fall back to v0 (dual PC)
+        if (e.reason == ConnectionErrorReason.ServiceNotFound && signalOptions.singlePeerConnection) {
+          logger.warning('v1 signal path not found, falling back to dual PC mode');
+          _v1PathUnavailable = true;
+          await signalClient.connect(
+            url,
+            token,
+            connectOptions: signalOptions.copyWith(singlePeerConnection: false),
+            roomOptions: this.roomOptions,
+          );
+        } else {
+          rethrow;
+        }
+      }
 
       // wait for join response
       await events.waitFor<EngineJoinResponseEvent>(
@@ -315,6 +431,9 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
 
     await subscriber?.dispose();
     subscriber = null;
+
+    _singlePCMode = false;
+    _midToTrackId = const {};
 
     await signalClient.cleanUp();
 
@@ -372,30 +491,27 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
     return null;
   }
 
-  Future<void> waitForBufferStatusLow(Reliability kind) async {
-    final Completer<void> completer = Completer();
+  // A full reconnect creates its empty channel before it finishes, and a send made in between
+  // is parked for a resume that never comes, so the wait also holds until the reconnect is over.
+  Future<void> waitForBufferStatusLow(Reliability kind) =>
+      _waitUntil(() => !_isReconnecting && (_dcBufferStatus[kind]! || isBufferStatusLow(kind) == true));
 
-    if (isBufferStatusLow(kind) == true) {
-      completer.complete();
-    } else {
-      onClosing() {
-        if (!completer.isCompleted) {
-          completer.completeError('Engine disconnected');
-        }
+  // Resolves once [isReady] holds, checking it again each time [_sendStateChanged] fires. Fails
+  // as soon as the engine closes, even when [isReady] already holds.
+  Future<void> _waitUntil(bool Function() isReady) async {
+    while (true) {
+      if (_isClosed || isDisposed) {
+        throw UnexpectedConnectionState('Engine disconnected');
       }
-
-      events.once<EngineClosingEvent>((e) => onClosing());
-
-      while (!completer.isCompleted && !_dcBufferStatus[kind]!) {
-        await Future.delayed(const Duration(milliseconds: 10));
-      }
-      if (completer.isCompleted) {
-        return;
-      }
-      completer.complete();
+      if (isReady()) return;
+      await _sendStateChanged.future;
     }
+  }
 
-    return completer.future;
+  // Holds a reliable send until a reconnect in progress finishes. Fails if the engine closes
+  // instead, which is how a reconnect that gives up ends.
+  Future<void> _waitForReconnection() async {
+    if (_isReconnecting) await _waitUntil(() => !_isReconnecting);
   }
 
   Future<void> _resendReliableMessagesForResume(int lastMessageSeq) async {
@@ -435,67 +551,96 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
     lk_models.DataPacket packet, {
     Reliability reliability = Reliability.lossy,
   }) async {
+    final isReliable = reliability == Reliability.reliable;
+    rtc.RTCDataChannel? channel;
+    lk_models.EncryptedPacket? encryptedPacket;
+
+    // A reliable packet sent during a full reconnect has no replay to wait for, so a reliable send
+    // waits the reconnect out, the way rust-sdks does. Every wait happens before the sequence
+    // number is taken, and the loop runs again if a reconnect started during them.
+    while (true) {
+      if (isReliable) {
+        await _waitForReconnection();
+      }
+
+      try {
+        if (_subscriberPrimary || _singlePCMode) {
+          // make sure publisher transport is connected
+          await ensurePublisherConnected();
+
+          // wait for data channel to open (if not already)
+          if (_publisherDataChannelState(reliability) != rtc.RTCDataChannelState.RTCDataChannelOpen) {
+            logger.fine('Waiting for data channel ${reliability} to open...');
+            await events.waitFor<PublisherDataChannelStateUpdatedEvent>(
+              filter: (event) => event.type == reliability,
+              duration: connectOptions.timeouts.connection,
+            );
+          }
+        }
+
+        // chose data channel
+        channel = _publisherDataChannel(reliability);
+
+        if (channel == null) {
+          throw UnexpectedStateException('Data channel for ${packet.kind.toSDKType()} is null');
+        }
+      } catch (_) {
+        // A full reconnect that starts during these waits resets the publisher connection and drops
+        // the channels. A reliable send waits it out and tries again, a lossy one is not worth
+        // sending late.
+        if (_isReconnecting) {
+          if (isReliable) continue;
+          logger.fine('Dropping lossy data packet during reconnection');
+          return;
+        }
+        rethrow;
+      }
+
+      encryptedPacket = null;
+      if (_e2eeManager != null && _e2eeManager!.isDataChannelEncryptionEnabled) {
+        final encryptablePacket = asEncryptablePacket(packet);
+        if (encryptablePacket != null) {
+          final encryptedData = await _e2eeManager?.encryptData(data: encryptablePacket.writeToBuffer());
+
+          if (encryptedData == null) {
+            logger.warning('Failed to encrypt data packet');
+            return;
+          }
+
+          encryptedPacket = lk_models.EncryptedPacket(
+            encryptionType: lk_models.Encryption_Type.GCM,
+            encryptedValue: encryptedData.data,
+            iv: encryptedData.iv,
+            keyIndex: encryptedData.keyIndex,
+          );
+        }
+      }
+
+      if (!isReliable || !_isReconnecting) break;
+    }
+
+    // Nothing below awaits before the send, so a reconnect cannot start in between.
+
     // Add sequence number for reliable packets
-    if (reliability == Reliability.reliable) {
+    if (isReliable) {
       packet.sequence = _reliableDataSequence++;
     }
 
     // construct the data channel message
-    var message = rtc.RTCDataChannelMessage.fromBinary(packet.writeToBuffer());
-
-    if (_subscriberPrimary) {
-      // make sure publisher transport is connected
-      await ensurePublisherConnected();
-
-      // wait for data channel to open (if not already)
-      if (_publisherDataChannelState(reliability) != rtc.RTCDataChannelState.RTCDataChannelOpen) {
-        logger.fine('Waiting for data channel ${reliability} to open...');
-        await events.waitFor<PublisherDataChannelStateUpdatedEvent>(
-          filter: (event) => event.type == reliability,
-          duration: connectOptions.timeouts.connection,
-        );
-      }
-    }
-
-    // chose data channel
-    final rtc.RTCDataChannel? channel = _publisherDataChannel(reliability);
-
-    if (channel == null) {
-      throw UnexpectedStateException('Data channel for ${packet.kind.toSDKType()} is null');
-    }
-
-    if (_e2eeManager != null && _e2eeManager!.isDataChannelEncryptionEnabled) {
-      final encryptablePacket = asEncryptablePacket(packet);
-      if (encryptablePacket != null) {
-        final encryptedData = await _e2eeManager?.encryptData(data: encryptablePacket.writeToBuffer());
-
-        if (encryptedData == null) {
-          logger.warning('Failed to encrypt data packet');
-          return;
-        }
-
-        final encryptedPacket = lk_models.EncryptedPacket(
-          encryptionType: lk_models.Encryption_Type.GCM,
-          encryptedValue: encryptedData.data,
-          iv: encryptedData.iv,
-          keyIndex: encryptedData.keyIndex,
-        );
-
-        final dataToSend = lk_models.DataPacket(
-          participantIdentity: packet.participantIdentity,
-          kind: packet.kind,
-          encryptedPacket: encryptedPacket,
-          destinationIdentities: packet.destinationIdentities,
-          sequence: packet.hasSequence() ? packet.sequence : null,
-          participantSid: packet.hasParticipantSid() ? packet.participantSid : null,
-        );
-
-        message = rtc.RTCDataChannelMessage.fromBinary(dataToSend.writeToBuffer());
-      }
-    }
+    final dataToSend = encryptedPacket == null
+        ? packet
+        : lk_models.DataPacket(
+            participantIdentity: packet.participantIdentity,
+            kind: packet.kind,
+            encryptedPacket: encryptedPacket,
+            destinationIdentities: packet.destinationIdentities,
+            sequence: packet.hasSequence() ? packet.sequence : null,
+            participantSid: packet.hasParticipantSid() ? packet.participantSid : null,
+          );
+    final message = rtc.RTCDataChannelMessage.fromBinary(dataToSend.writeToBuffer());
 
     // Buffer reliable packets for potential resending
-    if (reliability == Reliability.reliable) {
+    if (isReliable) {
       _reliableMessageBuffer.push(
         BufferedDataPacket(
           packet: packet,
@@ -505,21 +650,50 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
       );
     }
 
-    // Don't send during reconnection, but keep message buffered for resending
+    // A lossy packet is not held through a reconnect, it would only arrive stale.
     if (_isReconnecting) {
-      logger.fine('Deferring data packet send during reconnection (will resend when resumed)');
+      logger.fine('Dropping lossy data packet during reconnection');
       return;
     }
 
     logger.fine('sendDataPacket(label:${channel.label}, sequence:${packet.sequence})');
-    await channel.send(message);
-
-    _dcBufferStatus[reliability] = await channel.getBufferedAmount() <= channel.bufferedAmountLowThreshold!;
-
-    // Align buffer with WebRTC buffer for reliable packets
-    if (reliability == Reliability.reliable) {
-      _reliableMessageBuffer.alignBufferedAmount(await channel.getBufferedAmount());
+    try {
+      await channel.send(message);
+    } catch (e) {
+      if (_isClosed) throw UnexpectedConnectionState('Engine closed before the data packet was sent: $e');
+      rethrow;
     }
+    await _recordBufferedAmount(channel, reliability);
+  }
+
+  /// Reads the channel's buffered amount after a send, to keep the cached buffer status honest and
+  /// trim the resend buffer. A channel the engine closed or replaced since the send has nothing to
+  /// report, and the packet it carried is already out, so the send does not fail over it.
+  Future<void> _recordBufferedAmount(rtc.RTCDataChannel channel, Reliability reliability) async {
+    bool dropped() => _isClosed || !identical(channel, _publisherDataChannel(reliability));
+    // Null once the channel is gone, which ends the bookkeeping quietly.
+    Future<int?> read() async {
+      try {
+        final amount = await channel.getBufferedAmount();
+        return dropped() ? null : amount;
+      } catch (e) {
+        if (dropped()) {
+          logger.fine('Skipped the buffer bookkeeping of a ${reliability.name} channel the engine dropped: $e');
+          return null;
+        }
+        rethrow;
+      }
+    }
+
+    final buffered = await read();
+    if (buffered == null) return;
+    _setBufferStatus(reliability, buffered <= channel.bufferedAmountLowThreshold!);
+    if (reliability != Reliability.reliable) return;
+    // The resend buffer is trimmed from a second reading taken after the status write, so a packet
+    // another send queued in the meantime is counted as still buffered.
+    final aligned = await read();
+    if (aligned == null) return;
+    _reliableMessageBuffer.alignBufferedAmount(aligned);
   }
 
   Future<void> _publisherEnsureConnected() async {
@@ -661,7 +835,90 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
       rtcConfiguration = rtcConfiguration.copyWith(encodedInsertableStreams: true);
     }
 
+    // Keep gathering candidates after the connection is up, like the Swift, Android and JS SDKs,
+    // so a network change (e.g. Wi-Fi to cellular) yields new candidates without an ICE restart.
+    // libwebrtc defaults to gathering once. An explicit value from the app wins.
+    if (rtcConfiguration.continualGatheringPolicy == null) {
+      rtcConfiguration = rtcConfiguration.copyWith(
+        continualGatheringPolicy: RTCContinualGatheringPolicy.gatherContinually,
+      );
+    }
+
     return rtcConfiguration;
+  }
+
+  void _handleOnTrack(rtc.RTCTrackEvent event) {
+    logger.fine('[WebRTC] pc.onTrack');
+
+    final stream = event.streams.firstOrNull;
+    if (stream == null) {
+      // we need the stream to get the track's id
+      logger.severe('received track without mediastream');
+      return;
+    }
+
+    // doesn't get called reliably
+    event.track.onEnded = () {
+      logger.fine('[WebRTC] track.onEnded');
+    };
+
+    // doesn't get called reliably
+    stream.onRemoveTrack = (_) {
+      logger.fine('[WebRTC] stream.onRemoveTrack');
+    };
+
+    if (signalClient.connectionState == ConnectionState.reconnecting ||
+        signalClient.connectionState == ConnectionState.connecting) {
+      final track = event.track;
+      final receiver = event.receiver;
+      events.once<EngineConnectedEvent>((event) async {
+        Timer(const Duration(milliseconds: 10), () {
+          events.emit(
+            EngineTrackAddedEvent(
+              track: track,
+              stream: stream,
+              receiver: receiver,
+            ),
+          );
+        });
+      });
+      return;
+    }
+
+    if (connectionState == ConnectionState.disconnected) {
+      logger.warning('skipping incoming track after Room disconnected');
+      return;
+    }
+
+    events.emit(
+      EngineTrackAddedEvent(
+        track: event.track,
+        stream: stream,
+        receiver: event.receiver,
+      ),
+    );
+  }
+
+  /// The track sid for the media section [receiver] belongs to, from the
+  /// server's mid to track id mapping. Null when the receiver's transceiver is
+  /// not found or its mid is not mapped.
+  @internal
+  Future<String?> getTrackIdForReceiver(rtc.RTCRtpReceiver? receiver) async {
+    if (receiver == null || _midToTrackId.isEmpty) return null;
+    final pc = (subscriber ?? publisher)?.pc;
+    if (pc == null) return null;
+    try {
+      final transceivers = await pc.getTransceivers();
+      final receiverId = receiver.receiverId;
+      for (final transceiver in transceivers) {
+        if (transceiver.receiver.receiverId == receiverId) {
+          return _midToTrackId[transceiver.mid];
+        }
+      }
+    } catch (e) {
+      logger.warning('[$objectId] getTrackIdForReceiver() failed: $e');
+    }
+    return null;
   }
 
   Future<void> _createPeerConnections(RTCConfiguration rtcConfiguration) async {
@@ -670,11 +927,14 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
       rtcConfig: rtcConfiguration,
       connectOptions: connectOptions,
     );
-    subscriber = await Transport.create(
-      _peerConnectionCreate,
-      rtcConfig: rtcConfiguration,
-      connectOptions: connectOptions,
-    );
+
+    if (!_singlePCMode) {
+      subscriber = await Transport.create(
+        _peerConnectionCreate,
+        rtcConfig: rtcConfiguration,
+        connectOptions: connectOptions,
+      );
+    }
 
     publisher?.pc.onIceCandidate = (rtc.RTCIceCandidate candidate) {
       logger.fine('publisher onIceCandidate');
@@ -688,45 +948,52 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
       }
     };
 
-    subscriber?.pc.onIceCandidate = (rtc.RTCIceCandidate candidate) {
-      logger.fine('subscriber onIceCandidate');
-      signalClient.sendIceCandidate(candidate, lk_rtc.SignalTarget.SUBSCRIBER);
-    };
+    if (!_singlePCMode) {
+      subscriber?.pc.onIceCandidate = (rtc.RTCIceCandidate candidate) {
+        logger.fine('subscriber onIceCandidate');
+        signalClient.sendIceCandidate(candidate, lk_rtc.SignalTarget.SUBSCRIBER);
+      };
 
-    subscriber?.pc.onIceConnectionState = (rtc.RTCIceConnectionState state) async {
-      logger.fine('subscriber iceConnectionState: $state');
-      if (state == rtc.RTCIceConnectionState.RTCIceConnectionStateConnected) {
-        await _handleGettingConnectedServerAddress(subscriber!.pc);
+      subscriber?.pc.onIceConnectionState = (rtc.RTCIceConnectionState state) async {
+        logger.fine('subscriber iceConnectionState: $state');
+        if (state == rtc.RTCIceConnectionState.RTCIceConnectionStateConnected) {
+          await _handleGettingConnectedServerAddress(subscriber!.pc);
+        }
+      };
+
+      // in subscriber primary mode, the server opens the data channels on the subscriber
+      if (_subscriberPrimary) {
+        subscriber?.pc.onDataChannel = _onDataChannel;
       }
-    };
 
-    publisher?.onOffer = (offer) {
-      logger.fine('publisher onOffer');
-      signalClient.sendOffer(offer);
+      subscriber?.pc.onConnectionState = (state) async {
+        events.emit(
+          EngineSubscriberPeerStateUpdatedEvent(
+            state: state,
+            isPrimary: _subscriberPrimary,
+          ),
+        );
+        logger.fine('subscriber connectionState: $state');
+        if (state.isDisconnected() || state.isFailed()) {
+          await handleReconnect(
+            state.isFailed()
+                ? ClientDisconnectReason.peerConnectionFailed
+                : ClientDisconnectReason.peerConnectionClosed,
+            reconnectReason: lk_models.ReconnectReason.RR_SUBSCRIBER_FAILED,
+          );
+        }
+      };
+    }
+
+    publisher?.onOffer = (offer, offerId) {
+      logger.fine('publisher onOffer (offerId: $offerId)');
+      signalClient.sendOffer(offer, offerId);
     };
 
     publisher?.onNegotiationError = _onPublisherNegotiationError;
-
-    // in subscriber primary mode, server side opens sub data channels.
-    if (_subscriberPrimary) {
-      subscriber?.pc.onDataChannel = _onDataChannel;
-    }
-
-    subscriber?.pc.onConnectionState = (state) async {
-      events.emit(
-        EngineSubscriberPeerStateUpdatedEvent(
-          state: state,
-          isPrimary: _subscriberPrimary,
-        ),
-      );
-      logger.fine('subscriber connectionState: $state');
-      if (state.isDisconnected() || state.isFailed()) {
-        await handleReconnect(
-          state.isFailed() ? ClientDisconnectReason.peerConnectionFailed : ClientDisconnectReason.peerConnectionClosed,
-          reconnectReason: lk_models.ReconnectReason.RR_SUBSCRIBER_FAILED,
-        );
-      }
-    };
+    // subscribed video arrives on the publisher's recvonly sections in single PC mode
+    publisher?.negotiateReceivedVideoDependencyDescriptor = _singlePCMode;
+    publisher?.negotiateOpusNack = _singlePCMode;
 
     publisher?.pc.onConnectionState = (state) async {
       if ([
@@ -739,7 +1006,7 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
       events.emit(
         EnginePublisherPeerStateUpdatedEvent(
           state: state,
-          isPrimary: !_subscriberPrimary,
+          isPrimary: _singlePCMode || !_subscriberPrimary,
         ),
       );
       logger.fine('publisher connectionState: $state');
@@ -751,62 +1018,19 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
       }
     };
 
-    subscriber?.pc.onTrack = (rtc.RTCTrackEvent event) {
-      logger.fine('[WebRTC] pc.onTrack');
-
-      final stream = event.streams.firstOrNull;
-      if (stream == null) {
-        // we need the stream to get the track's id
-        logger.severe('received track without mediastream');
-        return;
-      }
-
-      // doesn't get called reliably
-      event.track.onEnded = () {
-        logger.fine('[WebRTC] track.onEnded');
-      };
-
-      // doesn't get called reliably
-      stream.onRemoveTrack = (_) {
-        logger.fine('[WebRTC] stream.onRemoveTrack');
-      };
-
-      if (signalClient.connectionState == ConnectionState.reconnecting ||
-          signalClient.connectionState == ConnectionState.connecting) {
-        final track = event.track;
-        final receiver = event.receiver;
-        events.once<EngineConnectedEvent>((event) async {
-          Timer(const Duration(milliseconds: 10), () {
-            events.emit(
-              EngineTrackAddedEvent(
-                track: track,
-                stream: stream,
-                receiver: receiver,
-              ),
-            );
-          });
-        });
-        return;
-      }
-
-      if (connectionState == ConnectionState.disconnected) {
-        logger.warning('skipping incoming track after Room disconnected');
-        return;
-      }
-
-      events.emit(
-        EngineTrackAddedEvent(
-          track: event.track,
-          stream: stream,
-          receiver: event.receiver,
-        ),
-      );
-    };
+    // In single PC mode, tracks arrive via publisher; otherwise via subscriber.
+    if (_singlePCMode) {
+      publisher?.pc.onTrack = _handleOnTrack;
+    } else {
+      subscriber?.pc.onTrack = _handleOnTrack;
+    }
 
     // doesn't get called reliably, doesn't work on mac
-    subscriber?.pc.onRemoveTrack = (rtc.MediaStream stream, rtc.MediaStreamTrack track) {
-      logger.fine('[WebRTC] ${track.id} pc.onRemoveTrack');
-    };
+    if (!_singlePCMode) {
+      subscriber?.pc.onRemoveTrack = (rtc.MediaStream stream, rtc.MediaStreamTrack track) {
+        logger.fine('[WebRTC] ${track.id} pc.onRemoveTrack');
+      };
+    }
 
     // also handle messages over the pub channel, for backwards compatibility
     try {
@@ -819,7 +1043,7 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
       _lossyDCPub?.stateChangeStream.listen(
         (state) => events.emit(
           PublisherDataChannelStateUpdatedEvent(
-            isPrimary: !_subscriberPrimary,
+            isPrimary: _singlePCMode || !_subscriberPrimary,
             state: state,
             type: Reliability.lossy,
           ),
@@ -827,8 +1051,13 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
       );
       // _onDCStateUpdated(Reliability.lossy, state)
       _lossyDCPub?.bufferedAmountLowThreshold = 2 * 1024 * 1024;
-      _lossyDCPub?.onBufferedAmountLow = (_) {
-        _dcBufferStatus[Reliability.lossy] = (_lossyDCPub!.bufferedAmount! <= _lossyDCPub!.bufferedAmountLowThreshold!);
+      // A new channel starts empty, whatever the one it replaces had buffered.
+      _setBufferStatus(Reliability.lossy, true);
+      final lossy = _lossyDCPub;
+      lossy?.onBufferedAmountLow = (_) {
+        // A channel a reconnect has dropped says nothing about the current one.
+        if (!identical(lossy, _lossyDCPub)) return;
+        _setBufferStatus(Reliability.lossy, lossy.bufferedAmount! <= lossy.bufferedAmountLowThreshold!);
       };
     } catch (err) {
       logger.severe('[$objectId] createDataChannel() did throw $err');
@@ -843,16 +1072,18 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
       _reliableDCPub?.stateChangeStream.listen(
         (state) => events.emit(
           PublisherDataChannelStateUpdatedEvent(
-            isPrimary: !_subscriberPrimary,
+            isPrimary: _singlePCMode || !_subscriberPrimary,
             state: state,
             type: Reliability.reliable,
           ),
         ),
       );
       _reliableDCPub?.bufferedAmountLowThreshold = 2 * 1024 * 1024;
-      _reliableDCPub?.onBufferedAmountLow = (_) {
-        _dcBufferStatus[Reliability.reliable] =
-            (_reliableDCPub!.bufferedAmount! <= _reliableDCPub!.bufferedAmountLowThreshold!);
+      _setBufferStatus(Reliability.reliable, true);
+      final reliable = _reliableDCPub;
+      reliable?.onBufferedAmountLow = (_) {
+        if (!identical(reliable, _reliableDCPub)) return;
+        _setBufferStatus(Reliability.reliable, reliable.bufferedAmount! <= reliable.bufferedAmountLowThreshold!);
       };
     } catch (err) {
       logger.severe('[$objectId] createDataChannel() did throw $err');
@@ -1039,29 +1270,13 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
           identity: dp.participantIdentity,
         ),
       );
-    } else if (dp.whichValue() == lk_models.DataPacket_Value.streamHeader) {
-      // Data Stream Header
+    } else if (dp.whichValue() == lk_models.DataPacket_Value.streamHeader ||
+        dp.whichValue() == lk_models.DataPacket_Value.streamChunk ||
+        dp.whichValue() == lk_models.DataPacket_Value.streamTrailer) {
+      // Data stream header / chunk / trailer, forwarded whole — see EngineDataStreamPacketEvent.
       events.emit(
-        EngineDataStreamHeaderEvent(
-          header: dp.streamHeader,
-          identity: dp.participantIdentity,
-          encryptionType: encryptionType,
-        ),
-      );
-    } else if (dp.whichValue() == lk_models.DataPacket_Value.streamChunk) {
-      // Data Stream Chunk
-      events.emit(
-        EngineDataStreamChunkEvent(
-          chunk: dp.streamChunk,
-          identity: dp.participantIdentity,
-          encryptionType: encryptionType,
-        ),
-      );
-    } else if (dp.whichValue() == lk_models.DataPacket_Value.streamTrailer) {
-      // Data Stream trailer
-      events.emit(
-        EngineDataStreamTrailerEvent(
-          trailer: dp.streamTrailer,
+        EngineDataStreamPacketEvent(
+          packet: dp,
           identity: dp.participantIdentity,
           encryptionType: encryptionType,
         ),
@@ -1107,7 +1322,7 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
 
     if (_reconnectAttempts >= _reconnectCount) {
       logger.fine('reconnectAttempts exceeded, disconnecting...');
-      _isClosed = true;
+      markClosed();
       await cleanUp();
 
       events.emit(
@@ -1118,11 +1333,7 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
       return;
     }
 
-    var delay = defaultRetryDelaysInMs[_reconnectAttempts];
-    // Add random jitter to prevent thundering herd on reconnect
-    if (_reconnectAttempts > 1) {
-      delay += math.Random().nextInt(1000);
-    }
+    final delay = reconnectDelayInMs(_reconnectAttempts);
 
     events.emit(
       EngineAttemptReconnectEvent(
@@ -1223,6 +1434,7 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
         unawaited(handleReconnect(ClientDisconnectReason.reconnectRetry));
       } else {
         logger.fine('attemptReconnect: disconnecting...');
+        markClosed();
         // clean up before emitting, room's EngineDisconnectedEvent handler
         // drops the event while fullReconnectOnNext is still true and
         // cleanUp() is what resets it
@@ -1279,7 +1491,7 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
 
     logger.fine('resumeConnection: reason: ${reason.name}');
 
-    if (_hasPublished) {
+    if (_publisherRequired) {
       logger.fine('resumeConnection: negotiating publisher...');
       await publisher!.createAndSendOffer(
         const RTCOfferOptions(
@@ -1293,7 +1505,9 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
     logger.fine('resumeConnection: primary is connected: $isConnected');
 
     if (!isConnected) {
-      subscriber!.restartingIce = true;
+      if (!_singlePCMode && subscriber != null) {
+        subscriber!.restartingIce = true;
+      }
       logger.fine('resumeConnection: Waiting for primary to connect...');
       await events.waitFor<EnginePeerStateUpdatedEvent>(
         filter: (event) => event.isPrimary && event.state.isConnected(),
@@ -1333,6 +1547,13 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
         await signalClient.cleanUp();
       }
 
+      // Drop the channels before the transports go, so a send whose bookkeeping lands during the
+      // teardown sees them as replaced instead of asking a closed channel for its buffered amount.
+      _reliableDCSub = null;
+      _reliableDCPub = null;
+      _lossyDCSub = null;
+      _lossyDCPub = null;
+
       await publisher?.dispose();
       publisher = null;
 
@@ -1341,17 +1562,23 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
       await subscriber?.dispose();
       subscriber = null;
 
-      _reliableDCSub = null;
-      _reliableDCPub = null;
-      _lossyDCSub = null;
-      _lossyDCPub = null;
+      // The new session starts its reliable sequence over, and nothing sent on the old one is
+      // replayed into it.
+      _reliableDataSequence = 1;
+      _reliableMessageBuffer.clear();
 
       await _signalListener.cancelAll();
 
-      _signalListener = signalClient.createListener(synchronized: true);
-      _setUpSignalListeners();
+      // disconnect() can run during the teardown above. It closes the engine
+      // for good, so do not connect again.
+      if (_isClosed) {
+        logger.fine('restartConnection: engine closed during teardown, not reconnecting');
+        return;
+      }
 
-      await connect(
+      _recreateSignalListener();
+
+      await _connect(
         regionUrl ?? url!,
         token!,
         roomOptions: roomOptions,
@@ -1359,7 +1586,7 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
         fastConnectOptions: fastConnectOptions,
       );
 
-      if (_hasPublished) {
+      if (_publisherRequired) {
         await ensurePublisherConnected();
       }
 
@@ -1397,8 +1624,18 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
     required Iterable<lk_rtc.TrackPublishedResponse>? publishTracks,
     required List<String> trackSidsDisabled,
   }) async {
-    final previousAnswer = (await subscriber?.pc.getLocalDescription())?.toPBType();
-    final previousOffer = (await subscriber?.pc.getRemoteDescription())?.toPBType();
+    lk_rtc.SessionDescription? previousAnswer;
+    lk_rtc.SessionDescription? previousOffer;
+
+    if (_singlePCMode) {
+      // In single PC mode, answer = publisher's remoteDescription,
+      // offer = publisher's localDescription.
+      previousAnswer = (await publisher?.pc.getRemoteDescription())?.toPBType();
+      previousOffer = (await publisher?.pc.getLocalDescription())?.toPBType();
+    } else {
+      previousAnswer = (await subscriber?.pc.getLocalDescription())?.toPBType();
+      previousOffer = (await subscriber?.pc.getRemoteDescription())?.toPBType();
+    }
 
     // Build data channel receive states for reliability
     final dataChannelReceiveStates = <lk_rtc.DataChannelReceiveState>[];
@@ -1427,10 +1664,18 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
     signalClient.sendQueuedRequests();
   });
 
+  void _recreateSignalListener() {
+    _signalListener = signalClient.createListener(synchronized: true);
+    _setUpSignalListeners();
+  }
+
   void _setUpSignalListeners() => _signalListener
     ..on<SignalJoinResponseEvent>((event) async {
       // create peer connections
       _subscriberPrimary = event.response.subscriberPrimary;
+      // Derive single PC mode from the actual signal path, not just the option.
+      // If v1 was unavailable, signalClient falls back to v0 and useV1SignalPath=false.
+      _singlePCMode = signalClient.useV1SignalPath;
       _serverInfo = event.response.serverInfo;
       final iceServersFromServer = event.response.iceServers.map((e) => e.toSDKType()).toList();
 
@@ -1456,7 +1701,7 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
         await _createPeerConnections(rtcConfiguration);
       }
 
-      if (!_subscriberPrimary || event.response.fastPublish) {
+      if (_singlePCMode || !_subscriberPrimary || event.response.fastPublish) {
         _enabledPublishCodecs = event.response.enabledPublishCodecs;
 
         /// for subscriberPrimary, we negotiate when necessary (lazy)
@@ -1489,9 +1734,11 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
       );
 
       await publisher?.pc.setConfiguration(rtcConfiguration.toMap());
-      await subscriber?.pc.setConfiguration(rtcConfiguration.toMap());
+      if (!_singlePCMode) {
+        await subscriber?.pc.setConfiguration(rtcConfiguration.toMap());
+      }
 
-      if (!_subscriberPrimary) {
+      if (_singlePCMode || !_subscriberPrimary) {
         await negotiate();
       }
 
@@ -1521,6 +1768,8 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
     })
     ..on<SignalDisconnectedEvent>((event) async {
       logger.fine('Signal disconnected ${event.reason}');
+      // disconnect() marks the engine closed before it tears anything down,
+      // so a close that arrives during that teardown starts no reconnect
       if (event.reason == DisconnectReason.disconnected && !_isClosed) {
         await handleReconnect(
           ClientDisconnectReason.signal,
@@ -1534,25 +1783,33 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
       // relaying here produced a duplicate disconnect per failure.
     })
     ..on<SignalOfferEvent>((event) async {
+      if (_singlePCMode) {
+        // In single PC mode, server uses mediaSectionsRequirement instead of offers.
+        logger.warning('Received SignalOfferEvent in single PC mode, ignoring');
+        return;
+      }
+      // Read once: disconnect() or a full reconnect can dispose and clear the
+      // subscriber while this handler awaits.
+      final subscriber = this.subscriber;
       if (subscriber == null) {
         logger.warning('[$objectId] subscriber is null');
         return;
       }
-      final signalingState = await subscriber!.pc.getSignalingState();
+      final signalingState = await subscriber.pc.getSignalingState();
       logger.fine(
         '[$objectId] Received server offer(type: ${event.sd.type}, '
-        '$signalingState)',
+        'offerId: ${event.offerId}, $signalingState)',
       );
       logger.finer('sdp: ${event.sd.sdp}');
 
-      await subscriber!.setRemoteDescription(event.sd);
+      _midToTrackId = event.midToTrackId;
+      await subscriber.setRemoteDescription(event.sd, offerId: event.offerId);
 
       try {
-        final answer = await subscriber!.pc.createAnswer();
+        final answer = await subscriber.createAndSetAnswer(event.sd);
         logger.fine('Created answer');
         logger.finer('sdp: ${answer.sdp}');
-        await subscriber!.pc.setLocalDescription(answer);
-        signalClient.sendAnswer(answer);
+        signalClient.sendAnswer(answer, event.offerId);
       } catch (_) {
         logger.severe('[$objectId] Failed to createAnswer()');
       }
@@ -1561,12 +1818,34 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
       if (publisher == null) {
         return;
       }
-      logger.fine('received answer (type: ${event.sd.type})');
-      logger.finer('sdp: ${event.sd.sdp}');
-      await publisher!.setRemoteDescription(event.sd);
+      // an answer to an older offer is never applied by the publisher transport, so
+      // neither its mapping nor anything else in it may replace the current state
+      if (publisher!.isStaleAnswer(event.offerId)) {
+        logger.warning(
+          'ignoring answer for old offer ${event.offerId}, latest is ${publisher!.latestOfferId}',
+        );
+        return;
+      }
+      logger.fine('received answer (type: ${event.sd.type}, offerId: ${event.offerId})');
+      logger.finer('sdp: ${event.sd.sdp}, midToTrackId: ${event.midToTrackId}');
+      // In dual PC mode the publisher answer carries no mapping and must not clobber
+      // the subscriber offer's. An empty mapping would wipe the current one as well.
+      if (_singlePCMode && event.midToTrackId.isNotEmpty) {
+        _midToTrackId = event.midToTrackId;
+      }
+      await publisher!.setRemoteDescription(event.sd, offerId: event.offerId);
       events.emit(const EngineSubscribedCodecRefreshRequestedEvent());
     })
     ..on<SignalTrickleEvent>((event) async {
+      if (_singlePCMode) {
+        if (publisher == null) {
+          logger.warning('Received ${SignalTrickleEvent} but publisher was null.');
+          return;
+        }
+        logger.fine('got ICE candidate from peer (single PC mode)');
+        await publisher!.addIceCandidate(event.candidate);
+        return;
+      }
       if (publisher == null || subscriber == null) {
         logger.warning('Received ${SignalTrickleEvent} but publisher or subscriber was null.');
         return;
@@ -1610,6 +1889,12 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
         await handleReconnect(ClientDisconnectReason.leaveReconnect);
       } else {
         // DISCONNECT or v12 server with canReconnect=false
+        if (_isClosed) {
+          // the echo of our own Leave, or a server Leave that raced
+          // disconnect(). The local teardown has run or is running.
+          logger.fine('[Signal] Leave received after disconnect() started, ignoring');
+          return;
+        }
         await signalClient.cleanUp();
         fullReconnectOnNext = false;
         await disconnect(reason: event.reason.toSDKType());
@@ -1624,25 +1909,68 @@ class Engine extends Disposable with EventsEmittable<EngineEvent> {
         signalClient.participantSid = event.response.participant.sid;
       }
       events.emit(EngineRoomMovedEvent(response: event.response));
+    })
+    ..on<SignalMediaSectionsRequirementEvent>((event) async {
+      if (!_singlePCMode || publisher == null) {
+        logger.warning('Received media sections requirement but not in single PC mode or publisher is null');
+        return;
+      }
+      // The server sends delta counts (how many *new* transceivers to add),
+      // not absolute totals. This matches the JS SDK behavior — we blindly
+      // add the requested number of recvonly transceivers each time.
+      // In single PC mode only the offerer (client) can add new m-lines,
+      // so the server signals when it needs additional media sections to
+      // deliver subscribed tracks.
+      logger.fine('Adding recvonly transceivers: audio=${event.numAudios}, video=${event.numVideos}');
+
+      final transceiverInit = rtc.RTCRtpTransceiverInit(
+        direction: rtc.TransceiverDirection.RecvOnly,
+      );
+
+      for (int i = 0; i < event.numAudios; i++) {
+        await publisher!.pc.addTransceiver(
+          kind: rtc.RTCRtpMediaType.RTCRtpMediaTypeAudio,
+          init: transceiverInit,
+        );
+      }
+      for (int i = 0; i < event.numVideos; i++) {
+        await publisher!.pc.addTransceiver(
+          kind: rtc.RTCRtpMediaType.RTCRtpMediaTypeVideo,
+          init: transceiverInit,
+        );
+      }
+
+      await negotiate();
     });
+
+  // Announce terminal closure before tearing down transports or event listeners.
+  // A full reconnect also disposes transports, but must keep the engine open.
+  @internal
+  void markClosed() {
+    if (_isClosed) return;
+    _isClosed = true;
+    _sendStateChanged.complete();
+    events.emit(EngineClosingEvent());
+  }
 
   Future<void> disconnect({
     DisconnectReason reason = DisconnectReason.clientInitiated,
   }) async {
-    _isClosed = true;
-    events.emit(EngineClosingEvent());
+    markClosed();
     if (connectionState == ConnectionState.connected) {
+      // Tell the server, then tear down locally without waiting for its Leave
+      // echo, the same as the other SDKs. The echo is not guaranteed: media
+      // nodes drop queued leave messages when they close the signal sink, and
+      // waiting for it cost a 10 s timeout whenever it was lost.
       await signalClient.sendLeave();
-    } else {
-      if (isPendingReconnect) {
-        logger.fine('disconnect: Cancel the reconnection processing!');
-        await signalClient.cleanUp();
-        await _signalListener.cancelAll();
-        _clearPendingReconnect();
-      }
-      await cleanUp();
-      events.emit(EngineDisconnectedEvent(reason: reason));
+    } else if (isPendingReconnect) {
+      logger.fine('disconnect: Cancel the reconnection processing!');
+      await signalClient.cleanUp();
+      await _signalListener.cancelAll();
+      _clearPendingReconnect();
     }
+    await cleanUp();
+    events.emit(EngineDisconnectedEvent(reason: reason));
   }
 
   void setRegionUrlProvider(RegionUrlProvider provider) {
