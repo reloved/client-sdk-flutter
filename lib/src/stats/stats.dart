@@ -81,7 +81,28 @@ class VideoSenderStats extends SenderStats {
 
   num? qualityLimitationResolutionChanges;
 
+  /// Seconds spent in each limitation state (`none`, `bandwidth`, `cpu`,
+  /// `other`) since the layer started
+  Map<String, num>? qualityLimitationDurations;
+
   num? retransmittedPacketsSent;
+
+  /// Bitrate the encoder is currently aiming for, in bits per second
+  num? targetBitrate;
+
+  num? framesEncoded;
+
+  /// Seconds spent encoding [framesEncoded]
+  num? totalEncodeTime;
+
+  /// The sender's estimate of how much it can send over the selected
+  /// candidate pair, in bits per second. Shared by every layer on the same
+  /// transport.
+  num? availableOutgoingBitrate;
+
+  /// Type of network the selected local candidate uses, e.g. `wifi`,
+  /// `cellular`, `ethernet` or `vpn`
+  String? networkType;
 }
 
 class ReceiverStats extends CodecStats {
@@ -201,6 +222,33 @@ String? getStringValFromReport(Map<dynamic, dynamic> values, String key) {
     return values[key] as String;
   }
   return null;
+}
+
+/// Like [getNumValFromReport], but null instead of throwing when the value is
+/// neither a number nor a numeric string.
+num? tryNumValFromReport(Map<dynamic, dynamic> values, String key) {
+  final value = values[key];
+  if (value is num) return value;
+  if (value is String) return num.tryParse(value);
+  return null;
+}
+
+/// Like [getStringValFromReport], but null instead of throwing when the value
+/// isn't a string.
+String? tryStringValFromReport(Map<dynamic, dynamic> values, String key) {
+  final value = values[key];
+  return value is String ? value : null;
+}
+
+/// A map of numbers, such as `qualityLimitationDurations`. Entries whose value
+/// isn't a number are left out.
+Map<String, num>? tryNumMapValFromReport(Map<dynamic, dynamic> values, String key) {
+  final value = values[key];
+  if (value is! Map) return null;
+  return {
+    for (final MapEntry(:key, :value) in value.entries)
+      if (key is String && value is num) key: value,
+  };
 }
 
 bool getBoolValFromReport(Map<dynamic, dynamic> values, String key) {
