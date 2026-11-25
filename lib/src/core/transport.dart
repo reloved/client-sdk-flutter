@@ -18,6 +18,7 @@ import 'dart:math' as math;
 import 'package:flutter_webrtc/flutter_webrtc.dart' as rtc;
 import 'package:meta/meta.dart';
 import 'package:sdp_transform/sdp_transform.dart' as sdp_transform;
+import 'package:synchronized/synchronized.dart' as sync;
 
 import '../exceptions.dart';
 import '../extensions.dart';
@@ -204,7 +205,72 @@ void applyVideoStartBitrate(Map<String, dynamic> media, int codecPayload, int st
   media['fmtp'] = fmtpList;
 }
 
-typedef TransportOnOffer = void Function(rtc.RTCSessionDescription offer);
+/// Adds plain NACK to every Opus payload in an audio media section.
+///
+/// The SFU negotiates audio feedback from the first audio section, so single-PC
+/// send-only sections must advertise it before subscriptions exist. Existing plain
+/// or wildcard NACK is preserved; `nack pli` does not imply plain NACK.
+@internal
+void ensureOpusNack(Map<String, dynamic> media) {
+  if (media['type'] != 'audio') return;
+  final opusPayloads = (media['rtp'] as List? ?? const [])
+      .where((rtp) => (rtp['codec'] as String?)?.toLowerCase() == 'opus')
+      .map((rtp) => rtp['payload'] as int)
+      .toSet();
+  if (opusPayloads.isEmpty) return;
+
+  final feedback = media['rtcpFb'] as List? ?? <dynamic>[];
+  for (final payload in opusPayloads) {
+    final hasNack = feedback.any(
+      (fb) =>
+          (fb['payload'] == payload || fb['payload'] == '*') &&
+          fb['type'] == 'nack' &&
+          (fb['subtype'] == null || fb['subtype'] == ''),
+    );
+    if (!hasNack) {
+      feedback.add({'payload': payload, 'type': 'nack'});
+    }
+  }
+  media['rtcpFb'] = feedback;
+}
+
+/// Accepts Opus NACK only on answer sections whose MID offered it.
+@internal
+String mungeOpusNackForAnswer(String answer, String offer) {
+  final offeredMedia = sdp_transform.parse(offer)['media'] as List? ?? const [];
+  final nackMids = <String>{};
+  for (final media in offeredMedia) {
+    if (media['type'] != 'audio' || media['mid'] == null) continue;
+    final opus = (media['rtp'] as List? ?? const [])
+        .where((rtp) => (rtp['codec'] as String?)?.toLowerCase() == 'opus')
+        .map((rtp) => rtp['payload'])
+        .toSet();
+    final feedback = media['rtcpFb'] as List? ?? const [];
+    if (opus.isNotEmpty &&
+        feedback.any(
+          (fb) =>
+              (fb['payload'] == '*' || opus.contains(fb['payload'])) &&
+              fb['type'] == 'nack' &&
+              (fb['subtype'] == null || fb['subtype'] == ''),
+        )) {
+      nackMids.add(media['mid'].toString());
+    }
+  }
+  if (nackMids.isEmpty) return answer;
+  final document = sdp_transform.parse(answer);
+  var changed = false;
+  for (final media in document['media'] as List? ?? const []) {
+    if (media['mid'] == null || !nackMids.contains(media['mid'].toString())) continue;
+    final before = (media['rtcpFb'] as List? ?? const []).length;
+    ensureOpusNack(media);
+    changed = changed || (media['rtcpFb'] as List? ?? const []).length != before;
+  }
+  return changed ? sdp_transform.write(document, null) : answer;
+}
+
+/// Called with each new offer and its id. Internal, the engine sends both to the server.
+@internal
+typedef TransportOnOffer = void Function(rtc.RTCSessionDescription offer, int offerId);
 typedef TransportOnNegotiationError = void Function(Object error);
 typedef PeerConnectionCreate =
     Future<rtc.RTCPeerConnection> Function(Map<String, dynamic> configuration, [Map<String, dynamic> constraints]);
@@ -230,6 +296,42 @@ class Transport extends Disposable {
 
   bool restartingIce = false;
   bool renegotiate = false;
+
+  /// Id the dependency descriptor extension was mapped to in the last offer, 0
+  /// before one was chosen. See [ensureVideoDDExtension].
+  int _ddExtID = 0;
+
+  /// Also negotiate the dependency descriptor on receive-only video sections. Set
+  /// in single PC mode, where subscribed video arrives on this transport's
+  /// recvonly sections, so SVC layers can be told apart on receive.
+  @internal
+  bool negotiateReceivedVideoDependencyDescriptor = false;
+
+  /// Advertise Opus NACK on local audio offers when this peer connection also receives.
+  /// Set from the effective single-PC mode, which can differ from the requested mode after fallback.
+  @internal
+  bool negotiateOpusNack = false;
+
+  /// Id of the last offer created. Ids start at 1, so 0 stays free for an answer from a
+  /// server that does not echo offer ids.
+  int _latestOfferId = 0;
+
+  /// Id of the last offer created on this transport, 0 before the first one.
+  @internal
+  int get latestOfferId => _latestOfferId;
+
+  /// Id of the last offer whose answer was applied.
+  int _answeredOfferId = 0;
+
+  /// Id (0 if unnumbered) of the answer being applied right now, so a copy that arrives
+  /// mid-apply is recognised as a duplicate too.
+  int? _answerInFlight;
+
+  /// Builds one offer at a time. A call that overlaps another waits for it, then finds that
+  /// offer waiting for its answer and defers to [renegotiate] instead of sending a second one.
+  /// Only an ICE restart replaces a waiting offer.
+  final _offerLock = sync.Lock();
+  @internal
   TransportOnOffer? onOffer;
   TransportOnNegotiationError? onNegotiationError;
   Function? _cancelDebounce;
@@ -310,16 +412,45 @@ class Transport extends Disposable {
     }
   }
 
-  Future<void> setRemoteDescription(rtc.RTCSessionDescription sd) async {
+  /// Whether an answer for [offerId] answers an offer older than the latest one
+  /// sent. Unnumbered answers (0, from servers that do not echo the id) never are.
+  @internal
+  bool isStaleAnswer(int offerId) => _latestOfferId > 0 && offerId > 0 && offerId != _latestOfferId;
+
+  /// [offerId] is the id of the offer an answer answers, or the server's id for a remote
+  /// offer. 0 from servers that send none.
+  Future<void> setRemoteDescription(rtc.RTCSessionDescription sd, {int offerId = 0}) async {
     if (isDisposed) {
       logger.warning('[$objectId] setRemoteDescription() already disposed');
       return;
     }
 
+    if (sd.type == 'answer') {
+      if (isStaleAnswer(offerId)) {
+        logger.warning('[$objectId] ignoring answer for old offer $offerId, latest is $_latestOfferId');
+        return;
+      }
+      if (_answerInFlight == offerId) {
+        logger.warning('[$objectId] ignoring duplicate answer (offerId: $offerId)');
+        return;
+      }
+      // claimed before any await, so a copy arriving mid-apply is caught too
+      _answerInFlight = offerId;
+    }
+
     try {
+      if (sd.type == 'answer' && await _isAnswered(offerId)) {
+        logger.warning('[$objectId] ignoring duplicate answer (offerId: $offerId)');
+        return;
+      }
       await pc.setRemoteDescription(sd);
+      // only a successfully applied answer makes later copies duplicates
+      if (sd.type == 'answer' && offerId > 0) _answeredOfferId = offerId;
     } catch (e) {
       logger.warning('[$objectId] setRemoteDescription() failed with error: $e');
+    } finally {
+      // released however the apply ends, so a genuine retry is still possible
+      if (sd.type == 'answer') _answerInFlight = null;
     }
 
     for (final candidate in _pendingCandidates) {
@@ -342,7 +473,18 @@ class Transport extends Disposable {
     }
   }
 
-  Future<void> createAndSendOffer([RTCOfferOptions? options]) async {
+  /// Whether the offer [offerId] answers already has its answer applied. Servers that do not
+  /// echo offer ids leave only the signaling state to go by: in `stable` there is no local
+  /// offer left to answer.
+  Future<bool> _isAnswered(int offerId) async {
+    if (offerId > 0) return offerId == _answeredOfferId;
+    return await pc.getSignalingState() == rtc.RTCSignalingState.RTCSignalingStateStable;
+  }
+
+  Future<void> createAndSendOffer([RTCOfferOptions? options]) =>
+      _offerLock.synchronized(() => _createAndSendOffer(options));
+
+  Future<void> _createAndSendOffer(RTCOfferOptions? options) async {
     if (isDisposed) {
       logger.warning('[$objectId] createAndSendOffer() already disposed');
       return;
@@ -361,14 +503,29 @@ class Transport extends Disposable {
     if (await pc.getSignalingState() == rtc.RTCSignalingState.RTCSignalingStateHaveLocalOffer) {
       // we're waiting for the peer to accept our offer, so we'll just wait
       // the only exception to this is when ICE restart is needed
-      final currentSD = await getRemoteDescription();
-      if ((options?.iceRestart ?? false) && currentSD != null) {
-        // TODO: handle when ICE restart is needed but we don't have a remote description
-        // the best thing to do is to recreate the peerconnection
-        await pc.setRemoteDescription(currentSD);
-      } else {
+      if (!(options?.iceRestart ?? false)) {
+        // Nothing may be awaited between reading the state and setting the flag. The answer
+        // can finish applying in that gap, and setRemoteDescription checks the flag only once,
+        // so a flag set after that check is never picked up and this offer is never sent.
         renegotiate = true;
         return;
+      }
+      final currentSD = await getRemoteDescription();
+      if (currentSD == null) {
+        // TODO: handle when ICE restart is needed but we don't have a remote description
+        // the best thing to do is to recreate the peerconnection
+        renegotiate = true;
+        return;
+      }
+      try {
+        await pc.setRemoteDescription(currentSD);
+      } catch (e) {
+        // The pending offer added media sections the last answer does not have (a
+        // track published, or a receive section the server asked for, in single PC
+        // mode), so the answer is rejected and the offer stays pending. Retrying
+        // would fail the same way: report it as a media failure so the next
+        // reconnect attempt rebuilds the peer connection.
+        throw MediaConnectException('ICE restart could not re-apply the last answer: $e');
       }
     }
 
@@ -377,7 +534,8 @@ class Transport extends Disposable {
     }
 
     // actually negotiate
-    logger.fine('starting to negotiate');
+    final offerId = ++_latestOfferId;
+    logger.fine('starting to negotiate (offerId: $offerId)');
     final offer = await pc.createOffer(options?.toMap() ?? <String, dynamic>{});
 
     if ((offer.sdp ?? '').contains('goog-sped-v1')) {
@@ -402,8 +560,15 @@ class Transport extends Disposable {
     }
     var appliedVideoStartBitrate = false;
     sdpParsed['media']?.forEach((media) {
+      if (negotiateOpusNack) {
+        ensureOpusNack(media);
+      }
       if (media['type'] == 'video') {
-        ensureVideoDDExtensionForSVC(media, media['type'], media['port'], media['protocol'], media['payloads']);
+        final codec = (media['rtp']?[0]?['codec'] as String?) ?? '';
+        final receiveOnly = media['direction'] == 'recvonly';
+        if (isSVCCodec(codec) || (receiveOnly && negotiateReceivedVideoDependencyDescriptor)) {
+          _ddExtID = ensureVideoDDExtension(media, sdpParsed['media'] ?? const [], _ddExtID);
+        }
 
         // mung sdp for codec bitrate setting that can't apply by sendEncoding
         for (var trackbr in _bitrateTrackers) {
@@ -425,6 +590,7 @@ class Transport extends Disposable {
     });
 
     final mungedSdp = sdp_transform.write(sdpParsed, null);
+
     try {
       await setMungedSDP(sd: offer, munged: mungedSdp);
     } catch (e) {
@@ -435,7 +601,7 @@ class Transport extends Disposable {
     if (appliedVideoStartBitrate && offer.sdp == mungedSdp) {
       _hasAppliedVideoStartBitrate = true;
     }
-    onOffer?.call(offer);
+    onOffer?.call(offer, offerId);
   }
 
   Future<void> addIceCandidate(rtc.RTCIceCandidate candidate) async {
@@ -485,6 +651,10 @@ class Transport extends Disposable {
     _bitrateTrackers.add(info);
   }
 
+  /// Adds the dependency descriptor extension to an SVC video section. Offers
+  /// now go through [ensureVideoDDExtension], which keeps one id for the whole
+  /// bundle; this per-section variant is kept for compatibility.
+  @Deprecated('Use Transport.ensureVideoDDExtension')
   bool ensureVideoDDExtensionForSVC(
     Map<String, dynamic> media,
     String? type,
@@ -493,33 +663,86 @@ class Transport extends Disposable {
     String? payloads,
   ) {
     final codec = media['rtp']?[0]?['codec']?.toLowerCase();
-    if (!isSVCCodec(codec)) {
+    if (!isSVCCodec(codec ?? '')) {
       return false;
     }
-
-    var maxID = 0;
-    bool ddFound = false;
-    final List<dynamic>? ext = media['ext'];
-    if (ext != null) {
-      for (var e in ext) {
-        if (e['uri'] == ddExtensionURI) {
-          ddFound = true;
-          continue;
-        }
-        if (e['value'] > maxID) {
-          maxID = e['value'];
-        }
-      }
-    }
-
+    final ddFound = (media['ext'] as List<dynamic>?)?.any((e) => e['uri'] == ddExtensionURI) ?? false;
     if (!ddFound) {
-      ext?.add({
-        'value': maxID + 1,
-        'uri': ddExtensionURI,
-      });
+      _ddExtID = ensureVideoDDExtension(media, [media], _ddExtID);
     }
-
     return ddFound;
+  }
+
+  /// Adds the AV1 dependency descriptor extension to [media] unless it is
+  /// already there, and returns the id it is mapped to so the caller can pass it
+  /// back in as [ddExtID] (0 when no id has been chosen yet). Returns [ddExtID]
+  /// unchanged when no id is consistent for the whole bundle.
+  ///
+  /// A bundle has to map one URI to one id, so an id already used for the
+  /// extension anywhere in [allMedia] wins over both the cached one and a fresh
+  /// one: libwebrtc advertises the extension on sections it can send on, and an
+  /// earlier offer may have munged it into others. In single PC mode sending and
+  /// receiving sections share the bundle, which is where a per-section id clashes.
+  @internal
+  static int ensureVideoDDExtension(Map<String, dynamic> media, List<dynamic> allMedia, int ddExtID) {
+    final id = _ddExtensionIdFor(allMedia, ddExtID);
+    if (id == null) return ddExtID;
+    final ext = (media['ext'] as List<dynamic>?) ?? (media['ext'] = <dynamic>[]);
+    if (!ext.any((e) => e['uri'] == ddExtensionURI)) {
+      ext.add({'value': id, 'uri': ddExtensionURI});
+    }
+    return id;
+  }
+
+  static int? _ddExtensionIdFor(List<dynamic> allMedia, int cachedId) {
+    final mapped = _mappedExtensionId(allMedia, ddExtensionURI);
+    if (mapped != null) {
+      // an id that also stands for another URI is what the bundle is rejected
+      // over, and libwebrtc's half of the map is not ours to renumber
+      return _usedForOtherUri(allMedia, mapped, ddExtensionURI) ? null : mapped;
+    }
+    // reusing the last offer's id keeps the mapping stable across renegotiations,
+    // as long as libwebrtc has not since given it to one of its own extensions
+    if (cachedId != 0 && !_usedForOtherUri(allMedia, cachedId, ddExtensionURI)) {
+      return cachedId;
+    }
+    return _unusedExtensionId(allMedia);
+  }
+
+  static Iterable<Map<dynamic, dynamic>> _extensions(List<dynamic> allMedia) sync* {
+    for (final media in allMedia) {
+      final ext = media['ext'];
+      if (ext is List) yield* ext.whereType<Map<dynamic, dynamic>>();
+    }
+  }
+
+  static int? _mappedExtensionId(List<dynamic> allMedia, String uri) {
+    for (final e in _extensions(allMedia)) {
+      if (e['uri'] == uri) return e['value'] as int;
+    }
+    return null;
+  }
+
+  static bool _usedForOtherUri(List<dynamic> allMedia, int id, String uri) =>
+      _extensions(allMedia).any((e) => e['value'] == id && e['uri'] != uri);
+
+  /// Above every id in use rather than filling gaps, so it is less likely to be
+  /// an id libwebrtc allocates next, and stepping over 15, which RFC 8285 reserves.
+  static int _unusedExtensionId(List<dynamic> allMedia) {
+    var maxId = 0;
+    for (final e in _extensions(allMedia)) {
+      final value = e['value'] as int;
+      if (value > maxId) maxId = value;
+    }
+    return maxId + 1 == 15 ? 16 : maxId + 1;
+  }
+
+  /// Creates and applies an answer accepting the server's offered Opus NACK.
+  Future<rtc.RTCSessionDescription> createAndSetAnswer(rtc.RTCSessionDescription offer) async {
+    final answer = await pc.createAnswer();
+    final munged = mungeOpusNackForAnswer(answer.sdp ?? '', offer.sdp ?? '');
+    await setMungedSDP(sd: answer, munged: munged == answer.sdp ? null : munged);
+    return answer;
   }
 
   Future<void> setMungedSDP({required rtc.RTCSessionDescription sd, String? munged, bool? remote}) async {
