@@ -1,5 +1,23 @@
 # CHANGELOG
 
+## 2.15.0
+
+### Minor Changes
+
+- RTCConfiguration.continualGatheringPolicy. Peer connections now gather ICE candidates continually by default, like the Swift, Android and JS SDKs, so a network change such as Wi-Fi to cellular produces new candidates without waiting for an ICE restart. Set RTCContinualGatheringPolicy.gatherOnce to keep the previous behavior. - [#1311](https://github.com/livekit/client-sdk-flutter/pull/1311) ([@lukasIO](https://github.com/lukasIO))
+- Single peer connection support - [#1025](https://github.com/livekit/client-sdk-flutter/pull/1025) ([@hiroshihorie](https://github.com/hiroshihorie))
+
+### Patch Changes
+
+- Keep one dependency descriptor extension id across the SDP bundle - [#1310](https://github.com/livekit/client-sdk-flutter/pull/1310) ([@cloudwebrtc](https://github.com/cloudwebrtc))
+- disconnect() tears the room down locally after sending the Leave instead of waiting for the server to echo it, so it no longer stalls 10 s when the echo is lost. A disconnect() call while one is already tearing down returns at once, so one Leave is sent and one disconnect reported - [#1208](https://github.com/livekit/client-sdk-flutter/pull/1208) ([@hiroshihorie](https://github.com/hiroshihorie))
+- A late close from a signal socket the SDK already replaced no longer starts another reconnect. In a browser it arrives up to seconds later, which made a room resume every 2 s after its first reconnect - [#1211](https://github.com/livekit/client-sdk-flutter/pull/1211) ([@hiroshihorie](https://github.com/hiroshihorie))
+- Offers and answers now carry offer ids, so a late answer to an offer that an ICE restart or a newer offer replaced is ignored instead of being applied to the wrong offer - [#1262](https://github.com/livekit/client-sdk-flutter/pull/1262) ([@hiroshihorie](https://github.com/hiroshihorie))
+- A track that fails to republish after a full reconnect no longer leaves the tracks after it unpublished or the room without a `RoomReconnectedEvent`. The failure is logged, the track is reported with a `LocalTrackUnpublishedEvent`, and the remaining tracks are republished - [#1302](https://github.com/livekit/client-sdk-flutter/pull/1302) ([@j-mercker](https://github.com/j-mercker))
+- Fully reconnect when a resume cannot restart ICE because the pending offer no longer matches the last answer - [#1025](https://github.com/livekit/client-sdk-flutter/pull/1025) ([@hiroshihorie](https://github.com/hiroshihorie))
+- Negotiate Opus NACK on every audio section in single peer connection mode, including send-only offers created before any subscriptions, enabling retransmission of lost audio in both publish and subscribe directions when RED is disabled, such as with end-to-end encryption. Accept server-offered Opus NACK in dual peer connection subscriber answers, with fallback if the modified answer is rejected - [#1025](https://github.com/livekit/client-sdk-flutter/pull/1025) ([@hiroshihorie](https://github.com/hiroshihorie))
+- Web: a signal connection that fails after it opened no longer throws an uncaught Future already completed error - [#1303](https://github.com/livekit/client-sdk-flutter/pull/1303) ([@j-mercker](https://github.com/j-mercker))
+
 ## 2.14.0
 
 * Added: Wire in the livekit_ffi Rust core behind a native-only facade, delivered as a bundled cdylib via Native Assets
