@@ -159,6 +159,26 @@ class LocalVideoTrack extends LocalTrack with VideoTrack {
           'qualityLimitationResolutionChanges',
         );
 
+        // Read with the tolerant helpers: a throw here stops the stats
+        // monitor for the whole track.
+        vs.qualityLimitationDurations = tryNumMapValFromReport(v.values, 'qualityLimitationDurations');
+        vs.targetBitrate = tryNumValFromReport(v.values, 'targetBitrate');
+        vs.framesEncoded = tryNumValFromReport(v.values, 'framesEncoded');
+        vs.totalEncodeTime = tryNumValFromReport(v.values, 'totalEncodeTime');
+
+        // The transport this layer is sent over, and through it the selected
+        // candidate pair and its local candidate
+        final transportId = tryStringValFromReport(v.values, 'transportId');
+        final transport = stats.firstWhereOrNull((element) => element.id == transportId);
+        final pairId = transport == null ? null : tryStringValFromReport(transport.values, 'selectedCandidatePairId');
+        final pair = stats.firstWhereOrNull((element) => element.id == pairId);
+        if (pair != null) {
+          vs.availableOutgoingBitrate = tryNumValFromReport(pair.values, 'availableOutgoingBitrate');
+          final localId = tryStringValFromReport(pair.values, 'localCandidateId');
+          final local = stats.firstWhereOrNull((element) => element.id == localId);
+          if (local != null) vs.networkType = tryStringValFromReport(local.values, 'networkType');
+        }
+
         // locate the appropriate remote-inbound-rtp item
         final remoteId = getStringValFromReport(v.values, 'remoteId');
         final r = stats.firstWhereOrNull((element) => element.id == remoteId);
